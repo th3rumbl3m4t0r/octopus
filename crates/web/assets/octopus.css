@@ -1,0 +1,104 @@
+/* octopus-web: page layout and the x11-design patterns it uses.
+   Everything visual comes from x11.css tokens. */
+body { min-height: 100vh; display: flex; flex-direction: column; }
+main { flex: 1; padding: 12px; display: grid; gap: 12px;
+       grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); align-content: start; }
+main.wide { grid-template-columns: 1fr; }
+.span2 { grid-column: 1 / -1; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.win > .body { display: flex; flex-direction: column; gap: 8px; overflow-x: auto; }
+pre { margin: 0; font-family: var(--font-mono); font-size: 12px; white-space: pre; overflow-x: auto; }
+pre.diff .add { color: var(--ok); }
+pre.diff .del { color: var(--danger); }
+pre.diff .hunk { color: var(--fg-dim); }
+textarea.config { width: 100%; min-height: 60vh; resize: vertical; line-height: 1.35; tab-size: 4; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+code { color: var(--accent); }
+
+/* pending generation: the one thing on the page that must not be missed */
+.pending { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.pending .titlebar { color: var(--warn); }
+.statusbar .count { color: var(--warn); }
+
+/* busy indicator, stepped rather than smooth */
+.busy::after { content: "|"; display: inline-block; width: 1ch; animation: spin .6s steps(4) infinite; }
+@keyframes spin { 0% { content: "|"; } 25% { content: "/"; } 50% { content: "-"; } 75% { content: "\\"; } }
+
+/* toast, appears and goes without a fade */
+.toast { position: fixed; right: 12px; bottom: 36px; min-width: 260px; max-width: 60vw; z-index: 100; }
+.toast[hidden] { display: none; }
+
+/* flat progress bar. Not ".bar": that is the top bar's row (#topbar .bar),
+   and a height on .bar squashes the whole header (x11-design's demo has
+   the same collision) */
+.meter { height: 8px; border: 1px solid var(--border); background: var(--panel-2); min-width: 80px; }
+.meter > i { display: block; height: 100%; background: var(--accent); }
+
+/* the top bar: links are blocks, so the whole tag is the click target */
+#topbar nav { flex-wrap: wrap; }
+#topbar nav a { display: inline-block; padding: 3px 8px; line-height: 1.4; }
+#topbar .bar { min-height: 30px; }
+
+/* login */
+.login { max-width: 360px; margin: 12vh auto 0; width: 100%; }
+.login form { display: flex; flex-direction: column; gap: 6px; }
+.login .art { color: var(--fg-dim); font-size: 11px; line-height: 1.15; margin: 0; }
+
+/* unapplied changes to router.toml (DNS, analyzer pages) */
+.changes { border: 1px solid var(--accent); }
+.changes ul { margin: 0; padding-left: 2ch; }
+input.grow { flex: 1; min-width: 24ch; }
+.chip { display: inline-flex; align-items: center; gap: 2px; padding: 0 0 0 6px; border: 1px solid var(--border);
+        background: var(--panel-2); white-space: nowrap; }
+button.x { padding: 0 6px; line-height: 1.2; border: 0; background: transparent; color: var(--fg-dim); }
+button.x:hover { color: var(--danger); background: transparent; }
+
+/* traffic graph: SVG paths, lines stay 1.5px however the box stretches */
+.graph svg { display: block; width: 100%; height: 160px; background: var(--panel-2); border: 1px solid var(--border); }
+.graph path { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.graph line.grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.graph path.rx, #tr-legend .rx { stroke: var(--ok); color: var(--ok); }
+.graph path.tx, #tr-legend .tx { stroke: var(--accent); color: var(--accent); }
+.axis { display: flex; justify-content: space-between; font-size: 11px; margin-top: -6px; }
+.titlebar select { padding: 0 4px; margin-left: 6px; }
+
+/* firewall overview: a heading row per direction */
+table.x11 tr.section th { padding-top: 10px; color: var(--accent); text-transform: none; font-size: 12px; }
+
+/* captured packets: rows pick the packet for the hex view */
+table.pick tr[data-i] { cursor: pointer; }
+table.pick tr.on td { background: var(--accent-soft); }
+pre.hex { line-height: 1.35; }
+pre.hex .off, pre.hex .h { color: var(--fg-dim); }
+pre.hex .m { color: var(--bg); background: var(--warn); }
+
+/* forms built from router.toml's schema: name | input and its help */
+.form { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 12px; align-items: start; }
+.form > .lbl { padding-top: 4px; white-space: nowrap; }
+.form > .lbl.req::after { content: " *"; color: var(--warn); }
+.fld { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fld > input:not([type=checkbox]), .fld > select, .fld textarea { max-width: 36em; }
+.fld textarea { width: 100%; font-family: var(--font-mono); }
+.help { color: var(--fg-dim); font-size: 11px; max-width: 60em; }
+.col { display: flex; flex-direction: column; gap: 4px; }
+.nested { border-left: 2px solid var(--border); padding-left: 8px; }
+.nested > .item { display: flex; gap: 6px; align-items: start; border-bottom: 1px dashed var(--border); padding-bottom: 6px; }
+.nested > .item > .form { flex: 1; }
+.editor { border: 1px solid var(--accent); padding: 8px; display: flex; flex-direction: column; gap: 8px; background: var(--panel-2); }
+.editor > .titlebar.sub { margin: -8px -8px 0; padding: 3px 8px; }
+td.acts { white-space: nowrap; text-align: right; }
+table.pick tr[data-i] td a { color: inherit; }
+a[data-qname] { color: var(--fg); text-decoration: underline dotted var(--fg-dim); }
+
+/* settings: the sections on the left, the one picked on the right */
+main.settings { grid-template-columns: 180px minmax(0, 1fr); }
+.settings-nav .body { gap: 0; }
+.settings-nav a { display: block; padding: 3px 6px; color: var(--fg); text-decoration: none; }
+.settings-nav a.on { background: var(--accent-soft); color: var(--accent); }
+main.settings > .pending, main.settings > .changes { grid-column: 1 / -1; }
+@media (max-width: 760px) { main.settings { grid-template-columns: 1fr; } }
+
+/* windows that only matter while the standing analyzer rules run */
+.running { display: contents; }
+.running[hidden] { display: none; }
+code.wrap { word-break: break-all; white-space: normal; }

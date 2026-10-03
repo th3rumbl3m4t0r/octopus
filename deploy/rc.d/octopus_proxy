@@ -1,0 +1,16 @@
+#!/bin/ksh
+#
+# Octopus proxy: the servers networks' egress (allowlist, verified upstream
+# TLS). Starts as root to read the interception root's key, hands it to its
+# signer process, then both drop to _octoproxy and pledge.
+
+daemon="/usr/local/sbin/octopus-proxy"
+daemon_flags="-c /etc/octopus/proxy.toml"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

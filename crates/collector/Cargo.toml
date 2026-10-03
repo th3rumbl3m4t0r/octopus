@@ -1,0 +1,20 @@
+[package]
+name = "octopus-collector"
+description = "IPFIX collector for pflow(4), flows labelled with the DNS names clients looked up"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "octopus-collector"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+libc.workspace = true

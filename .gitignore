@@ -1,0 +1,5 @@
+/target
+# never commit secrets or unredacted pfSense exports (design R7)
+secrets.toml
+*.raw
+/private

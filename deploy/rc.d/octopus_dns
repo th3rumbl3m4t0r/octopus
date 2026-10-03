@@ -1,0 +1,16 @@
+#!/bin/ksh
+#
+# Octopus DNS phase B: octopus-dns (hickory-server with per-query logging
+# and destination classification). It binds port 53 as root, then drops to
+# _octodns and pledges. Start octopus_pfhelper first.
+
+daemon="/usr/local/sbin/octopus-dns"
+daemon_flags="-c /etc/octopus/dns/octopus-dns.toml"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

@@ -1,0 +1,23 @@
+[package]
+name = "octopus-proxy"
+description = "Servers' egress proxy: SNI allowlist, verified upstream TLS, interception with a privilege-separated signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "octopus-proxy"
+path = "src/main.rs"
+
+[dependencies]
+octopus-pki.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+libc.workspace = true
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "time", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

@@ -1,0 +1,20 @@
+[package]
+name = "octopus-pfhelper"
+description = "Privileged pf table updater with a narrow, validated API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "octopus-pfhelper"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+libc.workspace = true

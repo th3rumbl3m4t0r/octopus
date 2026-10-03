@@ -1,0 +1,121 @@
+# Octopus example: the VLAN layout from the design document (section 6).
+# Placeholders throughout.
+
+[system]
+hostname = "octopus"
+domain = "home.arpa"
+openbsd_release = "7.9"
+timezone = "Europe/Prague"
+
+[interfaces.wan]
+mac = "00:00:00:00:00:01"
+name = "igc0"
+
+[interfaces.trunk]
+mac = "00:00:00:00:00:02"
+name = "igc1"
+
+[wan]
+interface = "wan"
+vlan = 848
+vlan_prio = 7
+pppoe = { user = "secret:pppoe_user", password = "secret:pppoe_pass" }
+mtu = 1492
+mss = 1452
+
+[[networks]]
+name = "mgmt"
+interface = "trunk"
+vlan = 10
+address = "10.10.0.1/24"
+kind = "mgmt"
+dhcp = { range = ["10.10.0.100", "10.10.0.199"] }
+
+[[networks]]
+name = "lan"
+interface = "trunk"
+vlan = 20
+address = "10.20.0.1/24"
+kind = "lan"
+dhcp = { range = ["10.20.0.100", "10.20.0.250"] }
+
+[[networks]]
+name = "servers"
+interface = "trunk"
+vlan = 30
+address = "10.30.0.1/24"
+kind = "servers"
+dhcp = { range = ["10.30.0.100", "10.30.0.199"] }
+
+[[hosts]]
+name = "tv"
+network = "lan"
+ip = "10.20.0.50"
+mac = "aa:bb:cc:dd:ee:ff"
+
+[[hosts]]
+name = "nas"
+network = "servers"
+ip = "10.30.0.10"
+mac = "aa:bb:cc:dd:ee:01"
+aliases = ["files"]
+
+[[tables]]
+name = "office"
+entries = ["203.0.113.0/24"]
+description = "office egress addresses"
+
+[[forwards]]
+name = "nas-ssh"
+proto = "tcp"
+port = 2222
+from = "office"
+to = "10.30.0.10"
+to_port = 22
+reflect = true
+
+[[rules]]
+network = "lan"
+action = "pass"
+to = "nas"
+proto = "tcp"
+port = "445"
+description = "lan may use the file server"
+
+[[links]]
+network = "servers"
+to = "203.0.113.10"
+proto = "tcp"
+port = 22
+description = "offsite backup"
+
+[dns]
+upstreams = [
+  { ip = "1.1.1.1", tls_name = "cloudflare-dns.com" },
+  { ip = "9.9.9.9", tls_name = "dns.quad9.net" },
+]
+records = [{ name = "app.example.com", ip = "10.30.0.10" }]
+
+[ntp]
+servers = ["ntp.nic.cz", "time.cloudflare.com"]
+
+[logging]
+remote = ["tls://10.10.0.5:6514"]
+pflow = "10.10.0.5:2055"
+
+[traffic]
+upload = "22M"
+download = "90M"
+destinations = [
+  { class = "streaming", domains = ["googlevideo.com", "nflxvideo.net", "ttvnw.net"] },
+  { class = "bulk", domains = ["deb.debian.org", "download.docker.com"] },
+]
+
+[wireguard]
+listen_port = 51820
+address = "10.99.0.1/24"
+private_key = "secret:wg_key"
+peers = [
+  { name = "laptop", public_key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", address = "10.99.0.2", policy = "mgmt" },
+  { name = "phone", public_key = "TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=", address = "10.99.0.3", policy = "lan" },
+]

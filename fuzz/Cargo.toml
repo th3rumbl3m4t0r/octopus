@@ -1,0 +1,61 @@
+[package]
+name = "octopus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+octopus-config = { path = "../crates/config" }
+octopus-render = { path = "../crates/render" }
+octopus-import-pfsense = { path = "../crates/import-pfsense" }
+octopus-pfhelper = { path = "../crates/pfhelper" }
+octopus-collector = { path = "../crates/collector" }
+
+# not part of the workspace: built with nightly by cargo fuzz
+[workspace]
+
+[[bin]]
+name = "router_toml"
+path = "fuzz_targets/router_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pfsense_import"
+path = "fuzz_targets/pfsense_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pfhelper_request"
+path = "fuzz_targets/pfhelper_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "small_parsers"
+path = "fuzz_targets/small_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipfix"
+path = "fuzz_targets/ipfix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fcap"
+path = "fuzz_targets/fcap.rs"
+test = false
+doc = false
+bench = false

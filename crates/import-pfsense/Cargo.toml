@@ -1,0 +1,14 @@
+[package]
+name = "octopus-import-pfsense"
+description = "pfSense config.xml to router.toml, and config.xml redaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+octopus-config.workspace = true
+roxmltree.workspace = true
+ipnet.workspace = true
+toml.workspace = true
+sha2.workspace = true

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/config",
+    "crates/render",
+    "crates/import-pfsense",
+    "crates/octopus",
+    "crates/pfhelper",
+    "crates/web",
+    "crates/dns",
+    "crates/pki",
+    "crates/proxy",
+    "crates/collector",
+    "crates/analyzer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/th3rumbl3m4t0r/octopus"
+
+[workspace.dependencies]
+octopus-config = { path = "crates/config" }
+octopus-render = { path = "crates/render" }
+octopus-import-pfsense = { path = "crates/import-pfsense" }
+octopus-pki = { path = "crates/pki" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+ipnet = { version = "2", features = ["serde"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
+roxmltree = "0.20"
+sha2 = "0.10"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

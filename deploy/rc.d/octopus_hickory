@@ -1,0 +1,15 @@
+#!/bin/ksh
+#
+# Octopus DNS phase A: the stock hickory-dns. It binds port 53 as root, then drops
+# to _octodns (user/group in named.toml). Flags come from octopus (rcctl).
+
+daemon="/usr/local/sbin/hickory-dns"
+daemon_flags="-q -c /etc/octopus/dns/named.toml"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

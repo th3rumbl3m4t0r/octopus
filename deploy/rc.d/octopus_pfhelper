@@ -1,0 +1,14 @@
+#!/bin/ksh
+#
+# Octopus pf table helper: the only path from unprivileged daemons to pf.
+# Accepts table updates on /var/run/octopus-pfhelper.sock (group _octodns).
+
+daemon="/usr/local/sbin/octopus-pfhelper"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

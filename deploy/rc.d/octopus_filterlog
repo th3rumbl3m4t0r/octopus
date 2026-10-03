@@ -1,0 +1,19 @@
+#!/bin/ksh
+#
+# pf's log as syslog lines: tcpdump reads pflog0 and logger sends each line
+# as program "filterlog" (local0.info), which syslogd forwards to the log
+# server with everything else.
+
+daemon="/usr/sbin/tcpdump"
+daemon_flags="-l -n -e -ttt -i pflog0"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_start() {
+	rc_exec "${daemon} ${daemon_flags} 2>/dev/null | logger -t filterlog -p local0.info"
+}
+
+rc_cmd $1

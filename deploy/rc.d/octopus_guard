@@ -1,0 +1,16 @@
+#!/bin/ksh
+#
+# octopus guard: devices on a restricted tier's addresses that may not use
+# them are cut off from the router (bridge rules); /etc/octopus/guard.json.
+
+daemon="/usr/local/sbin/octopus"
+daemon_flags="guard run"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+pexp="${daemon} guard run"
+
+rc_cmd $1

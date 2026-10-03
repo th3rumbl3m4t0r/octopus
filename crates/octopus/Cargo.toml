@@ -1,0 +1,24 @@
+[package]
+name = "octopus"
+description = "Octopus router compiler: check, build, apply with commit-confirm, rollback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "octopus"
+path = "src/main.rs"
+
+[dependencies]
+octopus-config.workspace = true
+octopus-render.workspace = true
+octopus-import-pfsense.workspace = true
+octopus-pki.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+libc.workspace = true
+similar = "2"

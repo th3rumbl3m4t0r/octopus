@@ -1,0 +1,298 @@
+# Octopus lab: the OpenBSD 7.9 sandbox VM (192.168.1.41) on a LAN.
+#
+# Safe on a shared LAN: vio0 keeps its address as the mgmt network and
+# serves no DHCP there; the test networks are VLANs 20/30 on vio0. There is
+# no [wan]: the default route goes via pfSense (192.168.1.1) from /etc/mygate.
+# (A DHCP WAN would make OpenBSD ignore mygate.) NAT and forwards are only
+# checked by pfctl -nf here. Password SSH stays on so the owner's login works.
+
+[system]
+hostname = "octolab"
+domain = "lab.home.arpa"
+openbsd_release = "7.9"
+timezone = "Europe/Prague"
+
+# lab ports: pair0 and pair2, patched to clients pair1 (rdomain 1) and pair3
+# (rdomain 2); create them before applying (see docs/operations.md)
+[interfaces.porta]
+mac = "02:00:00:00:99:00"
+name = "pair0"
+
+[interfaces.portb]
+mac = "02:00:00:00:99:02"
+name = "pair2"
+
+[interfaces.srvport]
+mac = "02:00:00:00:99:04"
+name = "pair4"
+description = "servers port (pair5 in rdomain 3 is the server)"
+
+[interfaces.trunk]
+mac = "02:00:5e:10:00:21"
+name = "vio0"
+description = "lab trunk"
+
+# the house ports: the two lab ports are one bridge; the tiers below without
+# a port of their own are on it (clients pick theirs by MAC, cable or VLAN)
+[lan]
+ports = ["porta", "portb"]
+
+[[tiers]]
+name = "mgmt"
+interface = "trunk"
+address = "192.168.1.41/24"
+kind = "mgmt"
+description = "home LAN, untagged; no DHCP and no IPv6 advertisements here"
+ipv6 = false
+
+# like gw's tiers: CD by MAC (the client in rdomain 1), DD for every other
+# cable (testbox), Wi-Fi and guests on VLANs 3 and 4
+[[tiers]]
+name = "cd"
+address = "10.51.1.1/24"
+macs = ["02:00:00:00:99:01"]
+description = "core distribution"
+dhcp = { range = ["10.51.1.100", "10.51.1.199"] }
+
+[[tiers]]
+name = "dd"
+address = "10.51.2.1/24"
+wired = true
+description = "desktop distribution: every other cable"
+dhcp = { range = ["10.51.2.10", "10.51.2.99"] }
+
+[[tiers]]
+name = "wifi"
+address = "10.51.3.1/24"
+vlan = 3
+dhcp = { range = ["10.51.3.10", "10.51.3.99"] }
+
+[[tiers]]
+name = "guest"
+address = "10.51.4.1/23"
+vlan = 4
+dhcp = { range = ["10.51.4.10", "10.51.5.250"] }
+
+[[tiers]]
+name = "servers"
+interface = "srvport"
+address = "10.30.0.1/24"
+kind = "servers"
+dhcp = { range = ["10.30.0.100", "10.30.0.199"] }
+
+[[routes]]
+to = "default"
+via = "192.168.1.1"
+
+[[hosts]]
+name = "buildvm"
+ip = "192.168.1.11"
+description = "swai jump host"
+
+[[hosts]]
+name = "testbox"
+ip = "10.51.2.150"
+mac = "02:00:00:00:99:03"
+description = "the client in rdomain 2; in the unfiltered DNS view"
+
+# the EAP620 HD v1 (OpenWrt 25.12.5, deploy/ap-image.sh), hanging off pfSense's
+# LAN: its address is pfSense's lease (the lab serves no DHCP on the house LAN)
+[[hosts]]
+name = "ap620"
+ip = "192.168.1.2"
+mac = "02:00:5e:10:00:3c"
+description = "EAP620 HD v1, OpenWrt; managed by octopus over SSH"
+
+# guests: the router's DNS and NTP, ping; nothing else inside (allow
+# exceptions above the block)
+[[rules]]
+network = "all"
+action = "pass"
+from = "net:guest"
+to = "self"
+proto = "tcp/udp"
+port = "53,123"
+description = "guests: the router's DNS and NTP"
+
+[[rules]]
+network = "all"
+action = "pass"
+from = "net:guest"
+to = "self"
+proto = "icmp"
+description = "guests: ping the router"
+
+[[rules]]
+network = "all"
+action = "block"
+from = "net:guest"
+to = "internal"
+description = "guests: nothing else inside"
+
+# managing the router (ssh, web UI)
+[[rules]]
+network = "all"
+action = "pass"
+from = "net:cd"
+to = "self"
+proto = "tcp"
+port = "22,8443"
+description = "CD manages the router"
+
+[[rules]]
+network = "all"
+action = "pass"
+from = "net:dd"
+to = "self"
+proto = "tcp"
+port = "22,8443"
+description = "DD manages the router"
+
+[[rules]]
+network = "all"
+action = "pass"
+from = "net:wifi"
+to = "self"
+proto = "tcp"
+port = "22,8443"
+description = "Wi-Fi manages the router"
+
+# Wi-Fi on the EAP620 HD. Only an SSID on the AP's own tier (mgmt, untagged)
+# works while the AP is cabled to pfSense: the wifi/guest VLANs would leave
+# the AP tagged into pfSense's switch port, where nothing answers. Move the
+# AP onto a lab port to test those.
+[wifi]
+
+[[wifi.networks]]
+ssid = "Yer a Wi-Fi Harry"
+tier = "mgmt"
+password = "secret:wifi_yer_a_wi_fi_harry"
+description = "clients land on the house LAN (pfSense DHCP)"
+
+# added from the web UI (generation 33): a guest SSID on VLAN 4; it leaves the
+# AP tagged, so nothing answers it until the AP hangs off a lab port
+[[wifi.networks]]
+ssid = "vigorlux_nomap"
+tier = "guest"
+isolate = true
+password = "secret:wifi_vigorlux_nomap"
+
+[[wifi.aps]]
+name = "ap620"
+host = "ap620"
+description = "EAP620 HD v1"
+
+[[tables]]
+name = "office"
+entries = ["203.0.113.0/24"]
+
+[[links]]
+network = "servers"
+to = "203.0.113.10"
+proto = "tcp"
+port = 22
+description = "example backup target"
+
+[dns]
+engine = "octopus-dns"
+upstreams = [
+  { ip = "1.1.1.2", tls_name = "security.cloudflare-dns.com" },
+  { ip = "1.0.0.2", tls_name = "security.cloudflare-dns.com" },
+]
+records = [{ name = "app.example.com", ip = "10.51.2.150" }]
+
+[[dns.views]]
+name = "unfiltered"
+upstreams = [
+  { ip = "1.1.1.1", tls_name = "cloudflare-dns.com" },
+  { ip = "1.0.0.1", tls_name = "cloudflare-dns.com" },
+]
+clients = ["testbox"]
+
+[ntp]
+servers = ["ntp.nic.cz", "time.cloudflare.com"]
+
+[ipv6]
+mode = "pd"	# no WAN in the lab: unique local addresses and advertisements only
+
+[logging]
+# a local TLS receiver that requires a client certificate (see operations.md)
+remote = ["tls://192.168.1.41:6514"]
+tls_ca = "/etc/octopus/syslog/ca.crt"
+tls_cert = "/etc/octopus/syslog/router.crt"
+tls_key = "/etc/octopus/syslog/router.key"
+pf = true
+pflow = "127.0.0.1:2055"	# octopus-collector on the router (phase 6)
+
+[ssh]
+password_auth = true
+root_login = "yes"
+
+# the lab's services root only covers lab.home.arpa and 192.168.1.0/24: a
+# web UI leaf naming 10.51.x fails verification outright (name constraints),
+# so the web UI keeps its self-signed certificate
+[web]
+certificate = "self-signed"
+
+# phase 3/4: classification tables and download queues (no WAN here, so no
+# upload tree). The rates only shape this VM's own traffic on vio0.
+[traffic]
+upload = "25M"
+download = "900M"
+destinations = [
+  { class = "streaming", domains = ["googlevideo.com", "nflxvideo.net", "ttvnw.net"] },
+  { class = "bulk", domains = ["openbsd.org", "deb.debian.org", "crates.io"] },
+]
+
+# phase 2: internal vhosts with leaves from the services intermediate
+[[vhosts]]
+name = "webapp"
+upstream = "http://192.168.1.31:80"
+description = "a web app, proxied as a test"
+
+[[vhosts]]
+name = "octoui"
+upstream = "https://192.168.1.41:8443"
+upstream_ca = "/etc/octopus/web/cert.pem"	# the web UI's own self-signed certificate ([web] above)
+upstream_name = "octolab.lab.home.arpa"
+websocket = true
+description = "the router's own web UI behind nginx, upstream verified"
+
+# phase 2: WireGuard; the lab's peer is wg1 in rdomain 1 on this same VM
+[wireguard]
+listen_port = 51820
+address = "10.99.0.1/24"
+private_key = "secret:wg_key"
+peers = [
+  { name = "lab-peer", public_key = "ZxYw1awhKChPgjbpdoxu0M6iik+uMwLt84fr0qE+sVs=", address = "10.99.0.2", policy = "mgmt" },
+]
+
+# phase 5: servers reach the web only through octopus-proxy (allowlist by SNI
+# and Host, origins' certificates verified, leaves from the interception
+# root); badssl.com hosts are allowed so the certificate checks are tested
+[proxy]
+
+[[proxy.allow]]
+network = "servers"
+hosts = ["badssl.com", "*.badssl.com", "cdn.openbsd.org", "deb.debian.org"]
+description = "test hosts and the OpenBSD/Debian mirrors"
+
+# phase 6: passive analysis (locked BPF filters from FCAP expressions);
+# off by default, switched on from the analyzer page
+[analyzer]
+enabled = false
+
+[[analyzer.rules]]
+name = "probe_2222"
+network = "dd"
+fcap = "proto tcp and dst port 2222 and tflags S/SA"
+action = "block"
+block_for = 120
+description = "a SYN to 2222 puts its source in lab_block for two minutes"
+
+[[analyzer.rules]]
+name = "http_evil"
+network = "dd"
+fcap = "proto tcp and dst port 80 and len > 60"
+regex = "(?i)GET /evil"
+description = "HTTP requests for /evil, kept in pcaps"

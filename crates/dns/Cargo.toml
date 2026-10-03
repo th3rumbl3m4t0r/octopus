@@ -1,0 +1,22 @@
+[package]
+name = "octopus-dns"
+description = "Octopus DNS (phase B): hickory-server with per-query logging and destination classification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "octopus-dns"
+path = "src/main.rs"
+
+[dependencies]
+hickory-server = { version = "=0.26.3", default-features = false, features = ["resolver", "tls-ring", "rustls-platform-verifier"] }
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["serde", "tls-ring", "rustls-platform-verifier"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "io-util", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+ipnet.workspace = true
+libc.workspace = true

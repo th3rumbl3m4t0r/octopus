@@ -1,0 +1,20 @@
+#!/bin/ksh
+#
+# Kea DHCPv4 for octopus (/etc/kea/kea-dhcp4.conf, rendered from router.toml);
+# the kea package's own rc script would start keactrl's four daemons.
+
+daemon="/usr/local/sbin/kea-dhcp4"
+daemon_flags="-c /etc/kea/kea-dhcp4.conf"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_pre() {
+	install -d -o _kea -g wheel -m 750 /var/run/kea
+	install -d -o root -g wheel -m 750 /var/lib/kea
+}
+
+rc_cmd $1

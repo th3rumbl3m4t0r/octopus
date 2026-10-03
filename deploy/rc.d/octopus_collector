@@ -1,0 +1,15 @@
+#!/bin/ksh
+#
+# Octopus flow collector: IPFIX from pflow(4) and DNS answers from
+# octopus-dns on loopback; flows labelled with names to /var/log/octopus-flows.
+
+daemon="/usr/local/sbin/octopus-collector"
+daemon_flags="-c /etc/octopus/collector.toml"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

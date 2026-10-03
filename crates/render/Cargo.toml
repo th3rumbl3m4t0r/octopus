@@ -1,0 +1,17 @@
+[package]
+name = "octopus-render"
+description = "Renders OpenBSD configuration files from a resolved router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+octopus-config.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+toml.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

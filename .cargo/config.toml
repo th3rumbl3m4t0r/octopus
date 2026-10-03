@@ -1,0 +1,3 @@
+[env]
+# octopus-analyzer links PCRE2 statically: the router has no pcre2 package
+PCRE2_SYS_STATIC = "1"

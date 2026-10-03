@@ -1,0 +1,131 @@
+#!/bin/ksh
+#
+# Octopus install.site. autoinstall(8) runs it at the end of the install,
+# chrooted into the new system, after unpacking the site set. install-live.sh
+# runs it on a live system (OCTOPUS_LIVE=1). Safe to run more than once.
+
+set -eu
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+
+say() { print -r -- "octopus install.site: $*"; }
+
+# ---- users: fixed ids so ownership survives reinstalls
+grep -q '^_octodns:' /etc/group || groupadd -g 860 _octodns
+id _octodns >/dev/null 2>&1 || useradd -u 860 -g 860 -c "Octopus DNS" -d /var/empty -s /sbin/nologin _octodns
+grep -q '^_octoweb:' /etc/group || groupadd -g 861 _octoweb
+id _octoweb >/dev/null 2>&1 || useradd -u 861 -g 861 -c "Octopus web UI" -d /var/empty -s /sbin/nologin _octoweb
+grep -q '^_octoproxy:' /etc/group || groupadd -g 862 _octoproxy
+id _octoproxy >/dev/null 2>&1 || useradd -u 862 -g 862 -c "Octopus proxy" -d /var/empty -s /sbin/nologin _octoproxy
+grep -q '^_octoflow:' /etc/group || groupadd -g 863 _octoflow
+id _octoflow >/dev/null 2>&1 || useradd -u 863 -g 863 -c "Octopus flows and analyzer" -d /var/empty -s /sbin/nologin _octoflow
+# the analyzer reaches the pf helper's socket (group _octodns) for lab blocks
+usermod -G _octodns _octoflow
+
+# ---- directories
+install -d -o root -g wheel -m 755 /etc/octopus /etc/octopus/dns /etc/octopus/dns/zones
+install -d -o root -g _octoweb -m 750 /etc/octopus/web
+install -d -o root -g wheel -m 755 /var/octopus
+install -d -o root -g wheel -m 700 /var/octopus/gen
+install -d -o _octoweb -g _octoweb -m 700 /var/octopus/staged
+install -d -o _octoflow -g _octoflow -m 750 /var/octopus/pcap
+
+# ---- shipped files
+bins="octopus octopus-web octopus-pfhelper octopus-dns octopus-proxy octopus-collector octopus-analyzer hickory-dns"
+for b in $bins; do
+	chown root:wheel /usr/local/sbin/$b
+	chmod 555 /usr/local/sbin/$b
+done
+chmod 555 /etc/rc.d/octopus_hickory /etc/rc.d/octopus_dns /etc/rc.d/octopus_web /etc/rc.d/octopus_pfhelper \
+    /etc/rc.d/octopus_filterlog /etc/rc.d/octopus_proxy /etc/rc.d/octopus_collector /etc/rc.d/octopus_analyzer
+install -d -o root -g wheel -m 700 /etc/octopus/syslog
+# the phase A script was called octopus_dns before octopus-dns existed
+if grep -q hickory-dns /etc/rc.d/octopus_dns 2>/dev/null; then
+	say "WARNING: /etc/rc.d/octopus_dns still runs hickory-dns"
+fi
+
+# ---- DNS query log (octopus-dns, syslog local5) with rotation
+for l in octopus-dns octopus-proxy octopus-flows octopus-analyzer; do
+	touch /var/log/$l
+	chmod 640 /var/log/$l
+	grep -q "^/var/log/$l" /etc/newsyslog.conf ||
+	    print "/var/log/$l\t\t\t640  14    10000 *     Z" >> /etc/newsyslog.conf
+done
+[ -f /etc/octopus/router.toml ] && chmod 644 /etc/octopus/router.toml
+if [ -f /etc/octopus/secrets.toml ]; then
+	chown root:wheel /etc/octopus/secrets.toml
+	chmod 600 /etc/octopus/secrets.toml
+else
+	say "WARNING: /etc/octopus/secrets.toml is missing; octopus apply will refuse to run"
+fi
+if [ -f /root/.ssh/authorized_keys ]; then
+	chown -R root:wheel /root/.ssh
+	chmod 700 /root/.ssh
+	chmod 600 /root/.ssh/authorized_keys
+fi
+
+# ---- web UI certificate: self-signed until the services root exists (phase 2)
+if [ ! -f /etc/octopus/web/key.pem ]; then
+	host=$(hostname 2>/dev/null || echo octopus)
+	openssl ecparam -name prime256v1 -genkey -noout -out /etc/octopus/web/key.pem
+	openssl req -new -x509 -days 825 -key /etc/octopus/web/key.pem \
+	    -out /etc/octopus/web/cert.pem -subj "/CN=${host}" \
+	    -addext "subjectAltName=DNS:${host}" 2>/dev/null ||
+	openssl req -new -x509 -days 825 -key /etc/octopus/web/key.pem \
+	    -out /etc/octopus/web/cert.pem -subj "/CN=${host}"
+	say "web UI certificate: $(openssl x509 -in /etc/octopus/web/cert.pem -noout -fingerprint -sha256)"
+fi
+chown root:_octoweb /etc/octopus/web/key.pem /etc/octopus/web/cert.pem
+chmod 640 /etc/octopus/web/key.pem
+chmod 644 /etc/octopus/web/cert.pem
+
+# ---- web UI users: an initial admin with a random password, for root only
+if [ ! -f /etc/octopus/web/users ]; then
+	pw=$(openssl rand -base64 18)
+	umask 077
+	print -r -- "admin $pw" > /root/octopus-web-password
+	print -r -- "admin:$(print -r -- "$pw" | /usr/local/sbin/octopus-web --hash)" > /etc/octopus/web/users
+	umask 022
+	say "web UI login: see /root/octopus-web-password"
+fi
+chown root:_octoweb /etc/octopus/web/users
+chmod 640 /etc/octopus/web/users
+
+# ---- doas: the web UI's exact commands, and wheel for the owner
+touch /etc/doas.conf
+if ! grep -q '^permit persist :wheel' /etc/doas.conf; then
+	print 'permit persist :wheel' >> /etc/doas.conf
+fi
+# rule by rule, so an upgrade adds the new ones
+grep '^permit' /etc/octopus/doas.conf | while read -r rule; do
+	grep -qxF "$rule" /etc/doas.conf || print -r -- "$rule" >> /etc/doas.conf
+done
+chown root:wheel /etc/doas.conf
+chmod 600 /etc/doas.conf
+doas -C /etc/doas.conf || { say "doas.conf has errors"; exit 1; }
+
+# ---- packages shipped in the site set (nginx for [[vhosts]])
+if [ -d /var/octopus/packages ] && ls /var/octopus/packages/*.tgz >/dev/null 2>&1; then
+	PKG_PATH=/var/octopus/packages pkg_add -I nginx || say "WARNING: pkg_add nginx failed"
+	PKG_PATH=/var/octopus/packages pkg_add -I kea || say "WARNING: pkg_add kea failed"
+fi
+install -d -o root -g wheel -m 755 /etc/octopus/pki /etc/octopus/pki/leaf
+
+# ---- leaves from the services intermediate: renewed daily
+touch /etc/daily.local
+# the access points' SSH key (their image carries the public half)
+[ -f /etc/octopus/ap.key ] || /usr/local/sbin/octopus ap key >/dev/null
+
+grep -q 'octopus pki renew' /etc/daily.local ||
+    print '/usr/local/sbin/octopus pki renew 2>&1 | logger -t octopus-pki' >> /etc/daily.local
+
+# ---- an unconfirmed generation must not survive a reboot
+touch /etc/rc.local
+grep -q 'octopus boot' /etc/rc.local || print '/usr/local/sbin/octopus boot' >> /etc/rc.local
+
+# ---- first boot: apply router.toml once the real interfaces are up
+if [ "${OCTOPUS_LIVE:-0}" != 1 ]; then
+	grep -q 'octopus apply' /etc/rc.firsttime 2>/dev/null ||
+	    print '/usr/local/sbin/octopus apply --no-confirm 2>&1 | logger -t octopus-firstboot' >> /etc/rc.firsttime
+fi
+
+say "done"

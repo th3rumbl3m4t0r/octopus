@@ -1,0 +1,44 @@
+# autoinstall(8) response file for the Octopus router (OpenBSD 7.9).
+# Copy to install.conf, fill in the <...> values, and give it to
+# deploy/mkinstall-img.sh (it goes into the ramdisk of the install stick as
+# /auto_install.conf, so the installer starts by itself after 5 seconds),
+# or serve it as autoinstall(8) describes.
+#
+# A key is the start of the installer's question; a question with no line
+# here gets the installer's default. The partitioning question is left out
+# on purpose: its default is MBR when the stick booted via BIOS and GPT via
+# UEFI, so the new system boots the way the stick did. The disk named as
+# root disk is erased without asking.
+#
+# The installer configures one interface so the first boot is reachable;
+# octopus applies router.toml from /etc/rc.firsttime and replaces it.
+
+System hostname = gw
+Which network interface do you wish to configure = igc1
+IPv4 address for igc1 = 192.168.1.1
+Netmask for igc1 = 255.255.255.0
+IPv6 address for igc1 = none
+Which network interface do you wish to configure = done
+Default IPv4 route = none
+DNS domain name = home.arpa
+DNS nameservers = none
+# encrypt(1) hash, not the password itself
+Password for root account = <$2b$... from: encrypt>
+Start sshd(8) by default = yes
+Do you expect to run the X Window System = no
+Change the default console to com0 = yes
+Which speed should com0 use = 115200
+Setup a user = no
+Allow root ssh login = prohibit-password
+Public ssh key for root account = <ssh-ed25519 AAAA... owner@host>
+What timezone are you in = UTC
+Which disk is the root disk = <sd0: the box's internal disk; sd1 is the stick>
+Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout = a
+Location of sets = disk
+Is the disk partition already mounted = no
+Which disk contains the install media = <sd1: the USB stick>
+Which sd1 partition has the install sets = a
+Pathname to the sets = 7.9/amd64
+Set name(s) = -x* -game* +site*
+Checksum test for site79.tgz failed. Continue anyway = yes
+Unverified sets: site79.tgz. Continue without verification = yes

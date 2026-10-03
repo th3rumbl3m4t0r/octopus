@@ -1,0 +1,13 @@
+[package]
+name = "octopus-config"
+description = "router.toml schema, secrets, name resolution and invariants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+ipnet.workspace = true
+schemars.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "octopus-pki"
+description = "The services root (\"snake root\"): name-constrained root and intermediate, 90-day leaves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser", "crypto"] }
+time = "0.3"
+ipnet.workspace = true
+getrandom = "0.3"
+x509-parser = "0.18"
