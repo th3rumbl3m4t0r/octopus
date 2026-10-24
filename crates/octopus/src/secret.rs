@@ -4,7 +4,6 @@
 //! and never touch the other secrets.
 
 use std::io::Read as _;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::os::{self, Res, log};
@@ -30,8 +29,18 @@ fn valid(key: &str, value: &str) -> Res<()> {
 /// Set `key` in secrets.toml (0600), keeping the rest of the file.
 fn set(key: &str, value: &str) -> Res<()> {
     valid(key, value)?;
-    let text = std::fs::read_to_string(SECRETS).unwrap_or_default();
-    let mut t: toml::Table = toml::from_str(&text).map_err(|e| format!("{SECRETS}: {e}"))?;
+    // only a missing file is empty: one that can't be read must not be
+    // replaced by a file with this one secret
+    let text = match std::fs::read_to_string(SECRETS) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{SECRETS}: {e}; not changing it")),
+    };
+    // the parser quotes the offending line: only its position leaves here
+    let mut t: toml::Table = toml::from_str(&text).map_err(|e: toml::de::Error| match e.span() {
+        Some(span) => format!("{SECRETS}: syntax error at byte {}; not changing it", span.start),
+        None => format!("{SECRETS}: syntax error; not changing it"),
+    })?;
     let changed = t.get(key).and_then(|v| v.as_str()) != Some(value);
     t.insert(key.to_string(), toml::Value::String(value.to_string()));
     if changed {
@@ -41,21 +50,15 @@ fn set(key: &str, value: &str) -> Res<()> {
         os::write_atomic(Path::new(SECRETS), format!("{comments}{body}").as_bytes(), 0o600, "root", "wheel")?;
         log(&format!("secret {key} set"));
     }
-    println!("secret {key} {}", if changed { "set" } else { "unchanged" });
+    out!("secret {key} {}", if changed { "set" } else { "unchanged" });
     Ok(())
 }
 
 pub fn cmd(args: &[String], staged: bool) -> Res<()> {
     if staged {
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(STAGED)
-            .map_err(|e| format!("{STAGED}: {e}"))?;
-        let mut text = String::new();
-        f.by_ref().take(4096).read_to_string(&mut text).map_err(|e| e.to_string())?;
+        let text = crate::os::read_owned(std::path::Path::new(STAGED), crate::os::WEB_USER, 4096);
         let _ = std::fs::remove_file(STAGED);
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("staged secret: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&text?).map_err(|e| format!("staged secret: {e}"))?;
         let (Some(k), Some(val)) = (v["key"].as_str(), v["value"].as_str()) else {
             return Err("staged secret: {key, value}".into());
         };

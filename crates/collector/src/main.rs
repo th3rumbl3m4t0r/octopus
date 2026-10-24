@@ -28,6 +28,9 @@ struct Config {
     user: String,
     ipfix: SocketAddr,
     dns: SocketAddr,
+    /// Where octopus-dns sends from (a port only root binds): answers from
+    /// anywhere else are forged.
+    dns_from: Option<SocketAddr>,
     #[serde(default)]
     networks: Vec<NetConf>,
 }
@@ -81,27 +84,42 @@ struct Answer {
 #[derive(Default)]
 struct Names {
     /// (client, address) -> name
-    pair: HashMap<(IpAddr, IpAddr), (String, Instant)>,
+    pair: HashMap<(IpAddr, IpAddr), (Arc<str>, Instant)>,
     /// address -> name (any client)
-    addr: HashMap<IpAddr, (String, Instant)>,
+    addr: HashMap<IpAddr, (Arc<str>, Instant)>,
 }
+
+/// Addresses taken from one answer, and the longest name (a DNS name is
+/// at most 253 characters): whatever a client makes the resolver answer,
+/// the tables stay small.
+const MAX_ADDRS: usize = 32;
+const MAX_NAME: usize = 253;
 
 impl Names {
     fn learn(&mut self, a: Answer) {
+        if a.q.len() > MAX_NAME {
+            return;
+        }
         let now = Instant::now();
         if self.pair.len() > MAX_PAIRS {
             self.pair.retain(|_, (_, t)| t.elapsed() < KEEP / 4);
             self.addr.retain(|_, (_, t)| t.elapsed() < KEEP / 4);
+            // still full: everything is recent, start over rather than grow
+            if self.pair.len() > MAX_PAIRS / 2 {
+                self.pair.clear();
+                self.addr.clear();
+            }
         }
-        for ip in a.a {
-            self.pair.insert((a.c, ip), (a.q.clone(), now));
-            self.addr.insert(ip, (a.q.clone(), now));
+        let q: Arc<str> = Arc::from(a.q.as_str());
+        for ip in a.a.into_iter().take(MAX_ADDRS) {
+            self.pair.insert((a.c, ip), (q.clone(), now));
+            self.addr.insert(ip, (q.clone(), now));
         }
     }
 
     fn label(&self, src: IpAddr, dst: IpAddr) -> Option<&str> {
-        fn fresh(e: &(String, Instant)) -> Option<&str> {
-            (e.1.elapsed() < KEEP).then_some(e.0.as_str())
+        fn fresh(e: &(Arc<str>, Instant)) -> Option<&str> {
+            (e.1.elapsed() < KEEP).then_some(&*e.0)
         }
         self.pair
             .get(&(src, dst))
@@ -195,10 +213,14 @@ fn run(conf: &str, validate: bool) -> Result<(), String> {
 
     let names = Arc::new(Mutex::new(Names::default()));
     let n2 = names.clone();
+    let cfg_from = cfg.dns_from;
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         loop {
-            let Ok((len, _)) = dns.recv_from(&mut buf) else { continue };
+            let Ok((len, from)) = dns.recv_from(&mut buf) else { continue };
+            if cfg_from.is_some_and(|f| f != from) {
+                continue;
+            }
             if let Ok(a) = serde_json::from_slice::<Answer>(&buf[..len]) {
                 n2.lock().unwrap().learn(a);
             }

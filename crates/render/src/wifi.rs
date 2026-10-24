@@ -82,7 +82,10 @@ fn script(r: &Router, w: &Wifi, ap: &AccessPoint, secrets: &SecretSource) -> Res
     let _ = writeln!(s, "# octopus-ap name={} address={}", ap.name, host.ip);
     s += &header("#", &["run on the access point by `octopus ap push` (over SSH, with the router's key)"]);
     s += "set -e\n";
-    // SHA (of this script) comes first from `octopus ap push`; FORCE=1 pushes anyway
+    // one push at a time on the access point too
+    s +=
+        "if command -v lock >/dev/null; then lock /var/lock/octopus-ap; trap 'lock -u /var/lock/octopus-ap' EXIT; fi\n";
+    // SHA (of this script) and FORCE=1 come first on stdin from `octopus ap push`
     s += "if [ -z \"$FORCE\" ] && [ -n \"$SHA\" ] && [ \"$(cat /etc/octopus-ap.sha 2>/dev/null)\" = \"$SHA\" ]; then echo unchanged; exit 0; fi\n\n";
     s += "# the uplink: the board's lan port, and the MAC the board gives it\n";
     s += "PORT=$(jsonfilter -i /etc/board.json -e '@.network.lan.ports[0]' 2>/dev/null || true)\n";
@@ -101,8 +104,12 @@ fn script(r: &Router, w: &Wifi, ap: &AccessPoint, secrets: &SecretSource) -> Res
         sq(&ap.name)
     );
     for v in &vlans {
-        let _ =
-            writeln!(s, "config device\n\toption name 'br-v{v}'\n\toption type 'bridge'\n\tlist ports '$PORT.{v}'\n");
+        // no IPv6 on the other tiers' bridges: the access point has no
+        // address there, so nothing on them reaches it
+        let _ = writeln!(
+            s,
+            "config device\n\toption name 'br-v{v}'\n\toption type 'bridge'\n\tlist ports '$PORT.{v}'\n\toption ipv6 '0'\n"
+        );
         let _ = writeln!(s, "config interface 'v{v}'\n\toption device 'br-v{v}'\n\toption proto 'none'\n");
     }
     s += "EOF\n";
@@ -115,6 +122,8 @@ fn script(r: &Router, w: &Wifi, ap: &AccessPoint, secrets: &SecretSource) -> Res
     s += "for svc in dnsmasq odhcpd firewall; do\n\t[ -x /etc/init.d/$svc ] && { /etc/init.d/$svc disable; /etc/init.d/$svc stop; } >/dev/null 2>&1 || true\ndone\n";
     s += "uci -q get system.@system[0] >/dev/null || { touch /etc/config/system; uci add system system >/dev/null; }\n";
     let _ = writeln!(s, "uci set system.@system[0].hostname={}", sq(&ap.name));
+    s += "# SSH only on its own address, not on the bridges of the other tiers\n";
+    s += "uci -q get dropbear.@dropbear[0] >/dev/null && uci set dropbear.@dropbear[0].Interface=lan\n";
     s += "\n# radios as the hardware has them, then ours\n";
     s += "rm -f /etc/config/wireless\nwifi config >/dev/null 2>&1 || true\n";
     s += "while uci -q delete wireless.@wifi-iface[0]; do :; done\n";
@@ -123,7 +132,9 @@ fn script(r: &Router, w: &Wifi, ap: &AccessPoint, secrets: &SecretSource) -> Res
     s += "\tuci set wireless.$i.device=\"$1\"; uci set wireless.$i.mode=ap; uci set wireless.$i.network=\"$2\"\n";
     s += "\tuci set wireless.$i.ssid=\"$3\"; uci set wireless.$i.encryption=\"$4\"\n";
     s += "\t[ -n \"$5\" ] && uci set wireless.$i.key=\"$5\"\n";
-    s += "\tuci set wireless.$i.isolate=\"$6\"; uci set wireless.$i.hidden=\"$7\"\n}\n";
+    // isolate: within the radio (ap_isolate) and from the other radio's
+    // clients on the same bridge (bridge port isolation): only the uplink
+    s += "\tuci set wireless.$i.isolate=\"$6\"; uci set wireless.$i.bridge_isolate=\"$6\"; uci set wireless.$i.hidden=\"$7\"\n}\n";
     s += "for r in $(uci -q show wireless | sed -n 's/^wireless\\.\\([^.=]*\\)=wifi-device$/\\1/p'); do\n";
     s += "\tband=$(uci -q get wireless.$r.band || true)\n";
     let country = w.country(&c.system.timezone).ok_or("wifi: no country")?;
@@ -145,9 +156,10 @@ fn script(r: &Router, w: &Wifi, ap: &AccessPoint, secrets: &SecretSource) -> Res
         s += "\t\t;;\n";
     }
     s += "\t*) uci set wireless.$r.disabled=1 ;;\n\tesac\ndone\n\n";
-    s += "uci commit\n[ -n \"$SHA\" ] && echo \"$SHA\" > /etc/octopus-ap.sha\n";
-    s += "# after we've answered: the new network may move this very connection\n";
-    s += "( set +e; sleep 1; /etc/init.d/system reload; /etc/init.d/network reload; sleep 2; wifi reload ) >/dev/null 2>&1 </dev/null &\n";
+    s += "uci commit\nrm -f /etc/octopus-ap.sha\n";
+    s += "# after we've answered: the new network may move this very connection;\n";
+    s += "# the script counts as taken only once all of it reloaded\n";
+    s += "( set +e; sleep 1; /etc/init.d/system reload && /etc/init.d/network reload && sleep 2 && wifi reload && /etc/init.d/dropbear reload && [ -n \"$SHA\" ] && echo \"$SHA\" > /etc/octopus-ap.sha ) >/dev/null 2>&1 </dev/null &\n";
     s += "echo applied\n";
     Ok(s)
 }

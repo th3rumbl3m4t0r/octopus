@@ -7,8 +7,9 @@
 #
 #   deploy/mkinstall-img.sh installXY.img siteXY.tgz auto_install.conf OUT.img
 #
-# Run on the build VM as root (vnconfig). Verify installXY.img against
-# OpenBSD's SHA256.sig with signify first; this script doesn't. The X and
+# Run on the build VM as root (vnconfig). installXY.img is checked against
+# OpenBSD's SHA256.sig (next to it, or SIG=path; SIG=none skips it, knowing
+# what that means) with the release's signify key. The X and
 # game sets are dropped from the image to make room; the site set is added
 # to SHA256 so its checksum passes (it still counts as unverified: the
 # response file answers that question).
@@ -26,6 +27,18 @@ grep -q '^Which disk is the root disk' "$resp" || { echo "$resp: no root disk an
 set=$(basename "$site")
 case "$set" in site[0-9][0-9].tgz) ;; *) echo "$site: expected siteXY.tgz" >&2; exit 1 ;; esac
 rel=${set#site}; rel=${rel%.tgz}; relp="${rel%?}.${rel#?}"	# 79 -> 7.9
+
+# the installer image as OpenBSD signed it
+sig=${SIG:-$(dirname "$img")/SHA256.sig}
+if [ "$sig" = none ]; then
+	echo "WARNING: $img not verified (SIG=none)" >&2
+else
+	[ -f "$sig" ] || { echo "$sig missing: download SHA256.sig next to the image (SIG=path, or SIG=none)" >&2; exit 1; }
+	key=/etc/signify/openbsd-$rel-base.pub
+	[ -f "$key" ] || { echo "$key missing: build on OpenBSD $relp" >&2; exit 1; }
+	(cd "$(dirname "$img")" && signify -C -p "$key" -x "$sig" "$(basename "$img")") ||
+	    { echo "$img doesn't match OpenBSD's signed SHA256" >&2; exit 1; }
+fi
 
 for v in vnd0 vnd1; do
 	vnconfig -l 2>/dev/null | grep -q "^$v: covering" && { echo "$v is in use" >&2; exit 1; }
@@ -67,12 +80,10 @@ rm -f "$sets"/x*"$rel".tgz "$sets/game$rel.tgz"
 install -m 644 "$site" "$sets/$set"
 (cd "$sets" && sha256 "$set" >> SHA256 && grep -v -E "x(base|font|serv|share)$rel|game$rel" SHA256 > SHA256.new && mv SHA256.new SHA256)
 
-# serial console for the bootloader and the installer
-cat > "$m1/etc/boot.conf" <<EOF
-stty com0 115200
-set tty com0
-set image /$relp/amd64/bsd.rd
-EOF
+{
+	[ "${CONSOLE:-}" = com0 ] && printf 'stty com0 115200\nset tty com0\n'
+	echo "set image /$relp/amd64/bsd.rd"
+} > "$m1/etc/boot.conf"
 
 df -h "$m1" | tail -1
 umount "$m1"

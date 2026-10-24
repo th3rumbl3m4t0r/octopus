@@ -23,6 +23,86 @@ mail.info\t\t\t\t\t\t/var/log/maillog
 ";
 
 pub const WEB_CONF: &str = "/etc/octopus/web.toml";
+pub const PFHELPER_CONF: &str = "/etc/octopus/pfhelper.conf";
+
+/// octopus-pfhelper's limits for lab_block: the addresses it never takes
+/// and how long an entry may live in pf.
+fn pfhelper_conf(r: &Router) -> String {
+    let expire = r
+        .cfg
+        .analyzer
+        .rules
+        .iter()
+        .filter(|a| a.action == AnalyzerAction::Block)
+        .map(|a| a.block_for)
+        .max()
+        .unwrap_or(3600);
+    let mut s =
+        header("#", &["octopus-pfhelper: lab_block never takes these; its entries end in pf after lab_block_expire"]);
+    let list: Vec<String> = protected(r).iter().map(|x| format!("\"{x}\"")).collect();
+    let _ = writeln!(s, "lab_block_expire = {expire}\nprotected = [{}]", list.join(", "));
+    s
+}
+
+/// What lab_block may never hold: the router's own addresses, the networks
+/// that manage it, the servers it depends on.
+pub(crate) fn protected(r: &Router) -> Vec<String> {
+    use std::net::IpAddr;
+    let c = &r.cfg;
+    let mut p: Vec<String> = vec![];
+    // every entry a prefix: a host is /32 or /128
+    let mut add = |x: String| {
+        let x = if x.contains('/') {
+            x
+        } else if x.contains(':') {
+            format!("{x}/128")
+        } else {
+            format!("{x}/32")
+        };
+        if !p.contains(&x) {
+            p.push(x);
+        }
+    };
+    for n in &r.nets {
+        add(n.addr.to_string());
+        if let Some(v) = n.v6 {
+            add(v.ula.addr().to_string());
+        }
+    }
+    for n in r.nets.iter().filter(|n| r.manages_router(n)) {
+        add(n.prefix.to_string());
+        if let Some(v) = n.v6 {
+            add(v.ula.trunc().to_string());
+        }
+    }
+    if let Some(w) = &c.wireguard {
+        add(w.address.addr().to_string());
+        for peer in w.peers.iter().filter(|x| x.policy == Kind::Mgmt) {
+            add(peer.address.to_string());
+        }
+    }
+    for u in c.dns.upstreams.iter().chain(c.dns.views.iter().flat_map(|v| &v.upstreams)) {
+        add(u.ip.to_string());
+    }
+    for h in c
+        .ntp
+        .servers
+        .iter()
+        .map(String::as_str)
+        .chain(c.logging.remote.iter().filter_map(|x| parse_remote(x).map(|t| t.1)))
+    {
+        if let Ok(ip) = h.trim_matches(['[', ']']).parse::<IpAddr>() {
+            add(ip.to_string());
+        }
+    }
+    if let Some(WanMode::Static { gateway, .. }) = c.wan.as_ref().and_then(|w| w.mode()) {
+        add(gateway.to_string());
+    }
+    for rt in &c.routes {
+        add(rt.via.to_string());
+    }
+    p
+}
 
 pub(crate) fn render(r: &Router, g: &mut Generation) {
     let c = &r.cfg;
@@ -54,12 +134,18 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
         let _ = writeln!(s, "ListenAddress {a}");
     }
     let _ = writeln!(s, "Port {}", c.ssh.port);
-    let _ = writeln!(s, "PermitRootLogin {}", c.ssh.root_login);
+    let _ = writeln!(s, "PermitRootLogin {}", c.ssh.root_login.name());
     let _ = writeln!(s, "PasswordAuthentication {}", if c.ssh.password_auth { "yes" } else { "no" });
     s += "KbdInteractiveAuthentication no\n";
     s += "AuthorizedKeysFile\t.ssh/authorized_keys\n";
     s += "Subsystem\tsftp\t/usr/libexec/sftp-server\n";
     g.file("/etc/ssh/sshd_config", s, Subsystem::Sshd);
+
+    // ---- dhcpleased: an address from the ISP, not its DNS servers
+    if let (Some(w), Some(WanMode::Dhcp)) = (&r.wan, c.wan.as_ref().and_then(|w| w.mode())) {
+        let s = format!("{}interface {} {{\n\tignore dns\n}}\n", header("#", &[]), w.egress);
+        g.file("/etc/dhcpleased.conf", s, Subsystem::Resolv);
+    }
 
     // ---- syslogd
     let mut s = header("#", &[]);
@@ -93,9 +179,10 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
         let mut s = header("#", &["octopus-collector: pflow's flows, labelled with the names clients looked up"]);
         let _ = writeln!(
             s,
-            "user = \"_octoflow\"\nipfix = \"{}\"\ndns = \"{}\"",
+            "user = \"_octoflow\"\nipfix = \"{}\"\ndns = \"{}\"\ndns_from = \"{}\"",
             crate::dns::COLLECTOR_IPFIX,
-            crate::dns::COLLECTOR_DNS
+            crate::dns::COLLECTOR_DNS,
+            crate::dns::COLLECTOR_FEED
         );
         for n in &r.nets {
             let _ = writeln!(s, "\n[[networks]]\nname = \"{}\"\nprefix = \"{}\"", n.name, n.prefix);
@@ -118,8 +205,11 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     // ---- services
     let dhcp = dhcpd::serving(r);
     let wan_dhcp = matches!(c.wan.as_ref().and_then(|w| w.mode()), Some(WanMode::Dhcp));
+    if c.dns.engine == DnsEngine::OctopusDns {
+        g.file(PFHELPER_CONF, pfhelper_conf(r), Subsystem::Dns);
+    }
     let mut svc = |name: &str, enabled: bool, flags: Option<String>, sub: Subsystem| {
-        let restart = !matches!(name, "pflogd" | "octopus_pfhelper");
+        let restart = name != "pflogd";
         g.services.push(Service { name: name.into(), enabled, flags, subsystem: sub, restart });
     };
     // Kea (its interfaces are in its config); base dhcpd is turned off by
@@ -138,8 +228,12 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     svc("syslogd", true, Some(sflags.join(" ")), Subsystem::Syslogd);
     svc("octopus_filterlog", c.logging.pf, None, Subsystem::Syslogd);
     svc("pflogd", true, None, Subsystem::Pf);
-    // the router resolves through octopus_dns; nothing else may rewrite resolv.conf
-    svc("resolvd", wan_dhcp, None, Subsystem::Resolv);
+    // the router resolves through its own DNS service; nothing else may
+    // rewrite resolv.conf (resolvd would put the ISP's servers first)
+    svc("resolvd", false, None, Subsystem::Resolv);
+    if wan_dhcp {
+        svc("dhcpleased", true, None, Subsystem::Resolv);
+    }
     svc("unwind", false, None, Subsystem::Dns);
     let phase_b = c.dns.engine == DnsEngine::OctopusDns;
     svc("octopus_hickory", !phase_b, (!phase_b).then(|| format!("-q -c {DNS_DIR}/named.toml")), Subsystem::Dns);

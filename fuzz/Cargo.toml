@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+toml = "0.9"
 octopus-config = { path = "../crates/config" }
 octopus-render = { path = "../crates/render" }
 octopus-import-pfsense = { path = "../crates/import-pfsense" }

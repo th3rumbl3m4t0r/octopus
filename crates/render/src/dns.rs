@@ -24,6 +24,10 @@ pub const PFHELPER_SOCKET: &str = "/var/run/octopus-pfhelper.sock";
 /// octopus-collector: IPFIX from pflow, DNS answers from octopus-dns.
 pub const COLLECTOR_IPFIX: &str = "127.0.0.1:2055";
 pub const COLLECTOR_DNS: &str = "127.0.0.1:2056";
+/// octopus-dns sends its answers to the collector from this port: below
+/// 1024, so only root binds it (octopus-dns does, before dropping to
+/// _octodns), and the collector takes answers from nothing else.
+pub const COLLECTOR_FEED: &str = "127.0.0.1:870";
 
 /// A zone serial that changes when the records do (no secondaries exist, so
 /// it only has to differ, not grow).
@@ -237,7 +241,7 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
             let _ = writeln!(s, "sinkhole = \"{sh}\"");
         }
         if c.logging.pflow.as_deref().is_some_and(|p| p.starts_with("127.")) {
-            let _ = writeln!(s, "collector = \"{COLLECTOR_DNS}\"");
+            let _ = writeln!(s, "collector = \"{COLLECTOR_DNS}\"\ncollector_from = \"{COLLECTOR_FEED}\"");
         }
         s += "min_retention = 3600\n";
         for n in &r.nets {
@@ -298,13 +302,19 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
 /// A view client as prefixes (hosts, networks and tables expanded).
 fn client_prefixes(r: &Router, cl: &str) -> Vec<String> {
     use octopus_config::Endpoint;
+    // a network's unique local /64 too: its clients may ask over IPv6
+    let net = |n: &octopus_config::Net| {
+        let mut v = vec![n.prefix.to_string()];
+        v.extend(n.v6.map(|x| x.ula.trunc().to_string()));
+        v
+    };
     match r.endpoint(cl) {
-        Ok(Endpoint::Any) => vec!["0.0.0.0/0".into()],
-        Ok(Endpoint::Router) => vec!["127.0.0.0/8".into()],
-        Ok(Endpoint::Internal) => r.nets.iter().map(|n| n.prefix.to_string()).collect(),
+        Ok(Endpoint::Any) => vec!["0.0.0.0/0".into(), "::/0".into()],
+        Ok(Endpoint::Router) => vec!["127.0.0.0/8".into(), "::1/128".into()],
+        Ok(Endpoint::Internal) => r.nets.iter().flat_map(net).collect(),
         // clients ask from the inside: nothing outside is a client
         Ok(Endpoint::Internet) => vec![],
-        Ok(Endpoint::Net(i)) => vec![r.nets[i].prefix.to_string()],
+        Ok(Endpoint::Net(i)) => net(&r.nets[i]),
         Ok(Endpoint::Addr(a)) => vec![a.to_string()],
         Ok(Endpoint::Table(t)) => r
             .cfg

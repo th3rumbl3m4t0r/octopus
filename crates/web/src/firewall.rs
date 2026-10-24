@@ -43,6 +43,8 @@ enum Side {
     Outside,
     /// a network, or None for several
     Inside(Option<String>),
+    /// the WireGuard tunnel's addresses (its peers)
+    Tunnel,
     Router,
 }
 
@@ -52,6 +54,9 @@ fn nets(c: &Config) -> Vec<(String, ipnet::Ipv4Net, Kind)> {
 
 fn side_of_net(c: &Config, a: &IpNet) -> Side {
     let IpNet::V4(a) = a else { return Side::Outside };
+    if c.wireguard.as_ref().is_some_and(|w| w.address.trunc().contains(a)) {
+        return Side::Tunnel;
+    }
     match nets(c).into_iter().find(|(_, p, _)| p.contains(a)) {
         Some((n, _, _)) => Side::Inside(Some(n)),
         None if nets(c).iter().any(|(_, p, _)| a.contains(p)) => Side::Inside(None),
@@ -140,6 +145,41 @@ fn slug(s: &str) -> String {
     out
 }
 
+/// An edit of an existing entry keeps what the form doesn't show: a rule's
+/// network and `from` (where pf puts it and whom it covers) while its
+/// source is the one the row showed, `reject` for a deny, a forward's name.
+pub fn keep(c: &Config, list: &str, at: usize, f: &FwRule, item: &mut Json) {
+    let Some(o) = item.as_object_mut() else { return };
+    match list {
+        "rules" => {
+            let Some(old) = c.rules.get(at) else { return };
+            let shown = match old.network.as_str() {
+                "all" if old.from == "any" => "internal".to_string(),
+                "wan" if old.from == "any" => "internet".to_string(),
+                _ if old.from != "any" => old.from.clone(),
+                n => format!("net:{n}"),
+            };
+            if f.source.trim() == shown {
+                o.insert("network".into(), json!(old.network));
+                if old.from == "any" {
+                    o.remove("from");
+                } else {
+                    o.insert("from".into(), json!(old.from));
+                }
+            }
+            if old.action == octopus_config::schema::Action::Reject && f.kind == "deny" {
+                o.insert("action".into(), json!("reject"));
+            }
+        }
+        "forwards" => {
+            if let Some(old) = c.forwards.get(at) {
+                o.insert("name".into(), json!(old.name));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The list and the entry for a rule. `replacing` is the forward being
 /// edited (its name may stay).
 pub fn entry(c: &Config, f: &FwRule, replacing: Option<usize>) -> Result<(&'static str, Json), String> {
@@ -209,6 +249,8 @@ pub fn entry(c: &Config, f: &FwRule, replacing: Option<usize>) -> Result<(&'stat
                 }
                 Side::Outside => "wan".to_string(),
                 Side::Inside(None) => "all".to_string(),
+                // WireGuard peers: `all` rules hold on the tunnel too
+                Side::Tunnel => "all".to_string(),
                 Side::Inside(Some(n))
                     if tiers && !c.networks.iter().any(|x| &x.name == n && x.kind == Kind::Servers) =>
                 {

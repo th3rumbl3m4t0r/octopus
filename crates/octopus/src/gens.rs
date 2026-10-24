@@ -44,6 +44,10 @@ pub struct Manifest {
     pub absent: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// MAC -> interface name of the physical ports when it was applied:
+    /// `octopus boot` checks the machine still names them so.
+    #[serde(default)]
+    pub ifmap: std::collections::BTreeMap<String, String>,
 }
 
 pub fn root() -> PathBuf {
@@ -129,6 +133,7 @@ pub fn store(
         services: g.services.clone(),
         absent: vec![],
         warnings,
+        ifmap: Default::default(),
     };
     save(&m)?;
     Ok(m)
@@ -139,13 +144,43 @@ pub fn save(m: &Manifest) -> Res<()> {
     write_atomic(&dir(m.generation).join("manifest.json"), t.as_bytes(), 0o600, "root", "wheel")
 }
 
-/// Generation 0: copies of every live file the first generation touches or
-/// octopus owns, and the services' rc state, so rollback can return the
-/// router to how it was before octopus.
+/// Generation 0: copies of every live file a generation touches or octopus
+/// owns, and the services' rc state, as they were before octopus, so
+/// rollback can return the router to that. Made at the first apply and
+/// extended whenever a later one manages something new.
 pub fn baseline(paths: &[String], services: Vec<Service>) -> Res<Manifest> {
     let d = dir(0);
     if d.exists() {
-        return load(0);
+        let mut m = load(0)?;
+        // written by an older generation already: no pre-octopus copy left to take
+        let ours: std::collections::BTreeSet<String> = list()
+            .into_iter()
+            .filter(|n| *n != 0)
+            .filter_map(|n| load(n).ok())
+            .flat_map(|g| g.files)
+            .map(|f| f.path)
+            .collect();
+        let mut changed = false;
+        for p in paths {
+            if m.files.iter().any(|f| &f.path == p) || m.absent.contains(p) {
+                continue;
+            }
+            match capture(p)? {
+                Some(f) if !ours.contains(p) => m.files.push(f),
+                _ => m.absent.push(p.clone()),
+            }
+            changed = true;
+        }
+        for s in services {
+            if !m.services.iter().any(|x| x.name == s.name) {
+                m.services.push(s);
+                changed = true;
+            }
+        }
+        if changed {
+            save(&m)?;
+        }
+        return Ok(m);
     }
     mkdir(&d)?;
     let mut all: Vec<String> = paths.to_vec();
@@ -160,25 +195,9 @@ pub fn baseline(paths: &[String], services: Vec<Service>) -> Res<Manifest> {
     let mut files = vec![];
     let mut absent = vec![];
     for p in all {
-        match fs::read(&p) {
-            Ok(c) => {
-                let meta = fs::metadata(&p).map_err(|e| format!("{p}: {e}"))?;
-                let target = file_path(0, &p);
-                fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-                write_atomic(&target, &c, 0o600, "root", "wheel")?;
-                use std::os::unix::fs::MetadataExt;
-                files.push(FileMeta {
-                    path: p.clone(),
-                    mode: meta.mode() & 0o7777,
-                    owner: name_of("/etc/passwd", meta.uid()).unwrap_or_else(|| "root".into()),
-                    group: name_of("/etc/group", meta.gid()).unwrap_or_else(|| "wheel".into()),
-                    subsystem: subsystem_of(&p),
-                    // treat every baseline file as secret: we don't know what's in it
-                    secret: true,
-                    sha256: sha(&c),
-                });
-            }
-            Err(_) => absent.push(p),
+        match capture(&p)? {
+            Some(f) => files.push(f),
+            None => absent.push(p),
         }
     }
     let m = Manifest {
@@ -190,9 +209,30 @@ pub fn baseline(paths: &[String], services: Vec<Service>) -> Res<Manifest> {
         services,
         absent,
         warnings: vec![],
+        ifmap: Default::default(),
     };
     save(&m)?;
     Ok(m)
+}
+
+/// Copy a live file into generation 0 (None: it doesn't exist).
+fn capture(p: &str) -> Res<Option<FileMeta>> {
+    let Ok(c) = fs::read(p) else { return Ok(None) };
+    let meta = fs::metadata(p).map_err(|e| format!("{p}: {e}"))?;
+    let target = file_path(0, p);
+    fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+    write_atomic(&target, &c, 0o600, "root", "wheel")?;
+    use std::os::unix::fs::MetadataExt;
+    Ok(Some(FileMeta {
+        path: p.to_string(),
+        mode: meta.mode() & 0o7777,
+        owner: name_of("/etc/passwd", meta.uid()).unwrap_or_else(|| "root".into()),
+        group: name_of("/etc/group", meta.gid()).unwrap_or_else(|| "wheel".into()),
+        subsystem: subsystem_of(p),
+        // treat every baseline file as secret: we don't know what's in it
+        secret: true,
+        sha256: sha(&c),
+    }))
 }
 
 fn name_of(file: &str, id: u32) -> Option<String> {
@@ -214,6 +254,9 @@ pub fn subsystem_of(path: &str) -> Subsystem {
         "/etc/sysctl.conf" => Subsystem::Sysctl,
         "/etc/rad.conf" => Subsystem::Rad,
         "/etc/dhcp6leased.conf" => Subsystem::Dhcp6,
+        "/etc/kea/kea-dhcp4.conf" => Subsystem::Dhcpd,
+        "/etc/acme-client.conf" => Subsystem::Nginx,
+        p if p.starts_with("/etc/octopus/ap/") => Subsystem::Ap,
         p if p.starts_with("/etc/octopus/dns/") => Subsystem::Dns,
         p if p.starts_with("/etc/octopus/web") => Subsystem::Web,
         "/etc/nginx/nginx.conf" => Subsystem::Nginx,

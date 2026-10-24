@@ -12,6 +12,8 @@
 
 set -eu
 [ $# -eq 2 ] || { echo "usage: $0 SITEDIR OUTDIR" >&2; exit 2; }
+# the installer extracts as root, keeping owners: everything in it must be root's
+[ "$(id -u)" = 0 ] || { echo "run as root: the set's files must belong to root" >&2; exit 1; }
 site=$(cd "$1" && pwd)
 out=$(cd "$2" && pwd)
 top=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +29,8 @@ cargo build --release --locked
 # compile + validate before packing anything (INV-6)
 chk=$(mktemp -d)
 trap 'rm -rf "$chk" ${stage:-}' EXIT
-sec=""
+# placeholders without one: never the build VM's own /etc/octopus/secrets.toml
+sec="--no-secrets"
 [ -f "$site/secrets.toml" ] && sec="-s $site/secrets.toml"
 target/release/octopus check --offline -c "$site/router.toml" $sec
 target/release/octopus build --offline -c "$site/router.toml" -o "$chk"
@@ -73,15 +76,19 @@ for p in $pkgs; do
 	    { echo "cannot download $f" >&2; exit 1; }
 done
 
-# Pack the top-level entries, never "." itself: the installer extracts with
-# tar -p, and a "./" entry would give the new system's / the staging
-# directory's mode (mktemp -d makes it 0700, which breaks every daemon).
-chmod 755 "$stage"
-entries=$(cd "$stage" && ls -A | sed 's|^|./|')
-tar -C "$stage" -czf "$out/site$rel.tgz" $entries
-if tar -tzf "$out/site$rel.tgz" | grep -qxE '\.?/?'; then
-	echo "BUG: site set contains an entry for /" >&2
+# Files only, root's: the installer extracts with tar -p, and a directory
+# entry would give the system's /, /etc, /usr/local or /root the staging
+# tree's owner and mode; missing directories are made with defaults and
+# install.site sets the ones of ours that need others.
+chown -R root:wheel "$stage"
+(cd "$stage" && find . -type f | sort) > "$chk/files"
+tar -C "$stage" -czf "$out/site$rel.tgz" -I "$chk/files"
+if tar -tzf "$out/site$rel.tgz" | grep -qxE '\.?/?|.*/'; then
+	echo "BUG: site set contains a directory entry" >&2
 	exit 1
 fi
 echo "wrote $out/site$rel.tgz ($(du -h "$out/site$rel.tgz" | cut -f1))"
-[ -f "$site/secrets.toml" ] && echo "NOTE: it contains secrets.toml"
+if [ -f "$site/secrets.toml" ]; then
+	echo "NOTE: it contains secrets.toml"
+fi
+exit 0

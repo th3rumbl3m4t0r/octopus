@@ -11,13 +11,17 @@
 //!   status           the blocked devices
 //!
 //! The blocks survive restarts (/var/octopus/guard-state.json) and are put
-//! back when the bridge is recreated.
+//! back when the bridge is recreated. They end after a day unless the
+//! device does it again, and a port takes at most MAX_BLOCKS of them.
+//!
+//! The ARP table is evidence anyone on the wire can forge (a request whose
+//! sender is someone else's MAC). So a MAC that may use a restricted tier
+//! sharing that port, or that holds a lease from Kea, is never blocked:
+//! the guard keeps honest devices in their tier, it is not a lock.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read as _;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -30,6 +34,12 @@ const CONF: &str = "/etc/octopus/guard.json";
 pub const STATE: &str = "/var/octopus/guard-state.json";
 const STAGED: &str = "/var/octopus/staged/guard.json";
 const EVERY: Duration = Duration::from_secs(5);
+/// Held by a pass and by a release: one changes the state at a time.
+const LOCK: &str = "/var/octopus/guard.lock";
+/// A block lasts this long after the device was last seen doing it.
+const KEEP: u64 = 24 * 3600;
+/// Blocks per port: each is a rule the bridge walks for every frame.
+const MAX_BLOCKS: usize = 64;
 
 #[derive(Deserialize)]
 struct Conf {
@@ -54,6 +64,9 @@ pub struct Blocked {
     pub veb: String,
     pub vport: String,
     pub at: u64,
+    /// When it was last seen on a restricted address (blocks end KEEP after).
+    #[serde(default)]
+    pub seen: u64,
 }
 
 pub fn load_state() -> BTreeMap<String, Blocked> {
@@ -99,12 +112,31 @@ fn block(veb: &str, vport: &str, mac: &str) -> Res<()> {
     os::run("ifconfig", &[veb, "rule", "block", "out", "on", vport, "src", mac]).map(|_| ())
 }
 
-/// One pass: new offenders blocked, missing rules put back.
+/// One pass: new offenders blocked, old blocks ended, missing rules put back.
 fn pass(conf: &Conf, st: &mut BTreeMap<String, Blocked>) -> Res<bool> {
     let mut changed = false;
+    let leased = crate::status::leased_macs();
     for (ip, mac, ifname) in arp() {
         let Some(p) = conf.restricted.iter().find(|p| p.vport == ifname && p.prefix.contains(&ip)) else { continue };
-        if ip == p.router || entitled(p, &ip.to_string(), &mac) || st.contains_key(&mac) {
+        if ip == p.router {
+            continue;
+        }
+        if let Some(b) = st.get_mut(&mac) {
+            // still at it: the block lasts (written down now and then, not every pass)
+            if now().saturating_sub(b.seen) > 600 {
+                b.seen = now();
+                changed = true;
+            }
+            continue;
+        }
+        // listed for a tier on this port, or known to Kea: an ARP entry alone
+        // (anyone can forge one with someone else's MAC) doesn't cut it off
+        let siblings = || conf.restricted.iter().filter(|o| o.veb == p.veb && o.vport == p.vport);
+        if entitled(p, &ip.to_string(), &mac) || siblings().any(|o| entitled(o, "", &mac)) || leased.contains(&mac) {
+            continue;
+        }
+        if st.values().filter(|b| b.vport == p.vport).count() >= MAX_BLOCKS {
+            log(&format!("guard: {mac} used {ip}, but {} already has {MAX_BLOCKS} blocks; not blocking more", p.vport));
             continue;
         }
         block(&p.veb, &p.vport, &mac)?;
@@ -115,9 +147,26 @@ fn pass(conf: &Conf, st: &mut BTreeMap<String, Blocked>) -> Res<bool> {
         ));
         st.insert(
             mac,
-            Blocked { ip: ip.to_string(), tier: p.tier.clone(), veb: p.veb.clone(), vport: p.vport.clone(), at: now() },
+            Blocked {
+                ip: ip.to_string(),
+                tier: p.tier.clone(),
+                veb: p.veb.clone(),
+                vport: p.vport.clone(),
+                at: now(),
+                seen: now(),
+            },
         );
         changed = true;
+    }
+    // blocks end a day after the device was last seen at it
+    let old: Vec<String> =
+        st.iter().filter(|(_, b)| now().saturating_sub(b.seen.max(b.at)) > KEEP).map(|(m, _)| m.clone()).collect();
+    for mac in old {
+        if let Some(b) = st.remove(&mac) {
+            unblock(&b, st)?;
+            log(&format!("guard: {mac} released after a day without using {}", b.ip));
+            changed = true;
+        }
     }
     // a recreated bridge forgot its rules
     let mut have: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -130,56 +179,63 @@ fn pass(conf: &Conf, st: &mut BTreeMap<String, Blocked>) -> Res<bool> {
     Ok(changed)
 }
 
+/// The port's rules rebuilt without `b` (veb can only flush them all).
+fn unblock(b: &Blocked, rest: &BTreeMap<String, Blocked>) -> Res<()> {
+    os::run("ifconfig", &[&b.veb, "flushrule", &b.vport])?;
+    for (m, o) in rest.iter().filter(|(_, o)| o.veb == b.veb && o.vport == b.vport) {
+        block(&o.veb, &o.vport, m)?;
+    }
+    Ok(())
+}
+
 fn run() -> Res<()> {
     log("guard: watching the restricted tiers");
-    let mut st = load_state();
     loop {
-        match fs::read_to_string(CONF)
-            .map_err(|e| e.to_string())
-            .and_then(|t| serde_json::from_str::<Conf>(&t).map_err(|e| e.to_string()))
-        {
-            Ok(conf) => match pass(&conf, &mut st) {
-                Ok(true) => save_state(&st)?,
-                Ok(false) => {}
-                Err(e) => log(&format!("guard: {e}")),
-            },
-            Err(e) => log(&format!("guard: {CONF}: {e}")),
+        // the state on disk is the truth (a release changes it); a failed
+        // write is logged and tried again: the guard never stops for it
+        if let Ok(_l) = os::lock_wait(Path::new(LOCK), 30) {
+            let mut st = load_state();
+            match fs::read_to_string(CONF)
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str::<Conf>(&t).map_err(|e| e.to_string()))
+            {
+                Ok(conf) => {
+                    let r = pass(&conf, &mut st);
+                    if let Err(e) = &r {
+                        log(&format!("guard: {e}"));
+                    }
+                    // what was done before an error is saved too
+                    if (r.is_err() || r.as_ref().is_ok_and(|c| *c))
+                        && let Err(e) = save_state(&st)
+                    {
+                        log(&format!("guard: {STATE}: {e}"));
+                    }
+                }
+                Err(e) => log(&format!("guard: {CONF}: {e}")),
+            }
         }
         std::thread::sleep(EVERY);
-        // a release by `octopus guard release` changed the state file
-        let disk = load_state();
-        if disk.len() != st.len() {
-            st = disk;
-        }
     }
 }
 
 /// Lift a block: the port's rules are rebuilt without it.
 fn release(mac: &str) -> Res<()> {
     let mac = normalize_mac(mac).ok_or_else(|| format!("{mac:?}: not a MAC address"))?;
+    let _l = os::lock_wait(Path::new(LOCK), 30)?;
     let mut st = load_state();
     let b = st.remove(&mac).ok_or_else(|| format!("{mac} is not blocked"))?;
-    os::run("ifconfig", &[&b.veb, "flushrule", &b.vport])?;
-    for (m, o) in st.iter().filter(|(_, o)| o.veb == b.veb && o.vport == b.vport) {
-        block(&o.veb, &o.vport, m)?;
-    }
+    unblock(&b, &st)?;
     save_state(&st)?;
     log(&format!("guard: {mac} released (it had used {})", b.ip));
-    println!("{mac} released");
+    out!("{mac} released");
     Ok(())
 }
 
 pub fn cmd(args: &[String], staged: bool) -> Res<()> {
     if staged {
-        let mut f = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(STAGED)
-            .map_err(|e| format!("{STAGED}: {e}"))?;
-        let mut text = String::new();
-        f.by_ref().take(1024).read_to_string(&mut text).map_err(|e| e.to_string())?;
+        let text = crate::os::read_owned(std::path::Path::new(STAGED), crate::os::WEB_USER, 1024);
         let _ = fs::remove_file(STAGED);
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("staged: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&text?).map_err(|e| format!("staged: {e}"))?;
         return release(v["mac"].as_str().unwrap_or(""));
     }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -187,7 +243,7 @@ pub fn cmd(args: &[String], staged: bool) -> Res<()> {
         ["release", mac] => release(mac),
         ["status"] | [] => {
             for (mac, b) in load_state() {
-                println!("{mac}  used {:<15} ({}) on {}  since {}", b.ip, b.tier, b.vport, b.at);
+                out!("{mac}  used {:<15} ({}) on {}  since {}", b.ip, b.tier, b.vport, b.at);
             }
             Ok(())
         }

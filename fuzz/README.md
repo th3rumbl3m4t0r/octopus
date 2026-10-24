@@ -5,13 +5,17 @@ Every parser of outside input has a target. Needs nightly and cargo-fuzz:
 ```sh
 rustup toolchain install nightly && cargo install cargo-fuzz
 cd fuzz
-cargo +nightly fuzz run -O router_toml       # router.toml: parse, resolve, check, render
-cargo +nightly fuzz run -O pfsense_import    # config.xml: import, redact
-cargo +nightly fuzz run -O pfhelper_request  # octopus-pfhelper requests: accepted => allow-listed and canonical
-cargo +nightly fuzz run -O small_parsers     # ifconfig output, secrets.toml, ports, syslog targets, rates
-cargo +nightly fuzz run -O ipfix             # pflow's IPFIX messages (octopus-collector)
-cargo +nightly fuzz run -O fcap              # FCAP -> pcap filter: output is filter syntax only
+cargo +nightly fuzz run -O -a router_toml    # router.toml: parse, resolve, check, render; no text becomes syntax
+cargo +nightly fuzz run -O -a pfsense_import    # config.xml: import, redact; the output parses, secrets stay out of Debug
+cargo +nightly fuzz run -O -a pfhelper_request  # octopus-pfhelper requests: accepted => allow-listed and canonical
+cargo +nightly fuzz run -O -a small_parsers     # ifconfig output, secrets.toml, ports, syslog targets, rates
+cargo +nightly fuzz run -O -a ipfix             # pflow's IPFIX messages (octopus-collector)
+cargo +nightly fuzz run -O -a fcap              # FCAP -> pcap filter: output is filter syntax only
 ```
+
+`-a` (debug assertions) keeps overflow checks on: without it, wrapping
+arithmetic never crashes and libFuzzer never sees it. The release profile
+of the router's binaries has overflow checks on too.
 
 Seed `corpus/<target>/` with real inputs (redacted config.xml, the site
 configs, a pflow capture). DNS wire parsing is hickory's (design R1), TLS and

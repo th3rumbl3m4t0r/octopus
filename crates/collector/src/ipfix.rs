@@ -7,6 +7,10 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// pflow's templates have about 20 fields and there are a handful of them.
+const MAX_FIELDS: usize = 64;
+const MAX_TEMPLATES: usize = 256;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Flow {
     pub src: Option<IpAddr>,
@@ -101,8 +105,15 @@ impl Parser {
                 }
                 fields.push(Field { id: id & 0x7fff, len });
             }
-            // variable-length fields (0xffff) aren't used by pflow; skip such templates
-            if tid >= 256 && !fields.is_empty() && fields.iter().all(|f| f.len != 0xffff) {
+            // variable-length (0xffff) and empty fields aren't used by pflow, nor
+            // more than a few dozen fields: skip such templates; and keep a few
+            let sane = !fields.is_empty()
+                && fields.len() <= MAX_FIELDS
+                && fields.iter().all(|f| f.len != 0xffff && f.len != 0);
+            if tid >= 256
+                && sane
+                && (self.templates.len() < MAX_TEMPLATES || self.templates.contains_key(&(domain, tid)))
+            {
                 self.templates.insert((domain, tid), fields);
             }
         }
@@ -137,8 +148,8 @@ fn records(t: &[Field], body: &[u8]) -> Vec<Flow> {
                 (1, _) => f.bytes = uint(v),
                 (152, _) => f.start_ms = uint(v),
                 (153, _) => f.end_ms = uint(v),
-                (150, _) => f.start_ms = uint(v) * 1000,
-                (151, _) => f.end_ms = uint(v) * 1000,
+                (150, _) => f.start_ms = uint(v).saturating_mul(1000),
+                (151, _) => f.end_ms = uint(v).saturating_mul(1000),
                 _ => {}
             }
         }

@@ -3,9 +3,12 @@
 //! everything privileged goes through `doas` rules that allow exactly
 //!
 //!   octopus status --json | diff --staged | apply --staged | confirm | rollback
+//!           | ap push [--force] | secret --staged | guard release --staged
+//!   octopus-analyzer --oneshot /var/octopus/staged/capture.json
 //!
-//! Config edits are checked in-process (placeholder secrets) and staged in
-//! /var/octopus/staged/ for `octopus apply --staged` to rebuild from scratch.
+//! (deploy/doas.conf). Config edits are checked in-process (placeholder
+//! secrets) and staged in /var/octopus/staged/ for `octopus apply --staged`
+//! to rebuild from scratch. Users marked `:ro` in the users file may only look.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -62,8 +65,11 @@ struct App {
     own: Vec<std::net::IpAddr>,
     auth: auth::Auth,
     status: Mutex<Option<(Instant, Value)>>,
-    /// one privileged action at a time
-    action: tokio::sync::Mutex<()>,
+    /// one status run at a time: the others wait and share its answer
+    status_run: tokio::sync::Mutex<()>,
+    /// one privileged action at a time; held until its process exits, not
+    /// just until the request that started it ends
+    action: Arc<tokio::sync::Mutex<()>>,
     /// one capture at a time (they hold a bpf device for up to 30 s)
     capture: tokio::sync::Mutex<()>,
     traffic: Arc<traffic::Traffic>,
@@ -126,6 +132,10 @@ async fn guard(State(app): State<Shared>, req: axum::extract::Request, next: Nex
         }
     } else if user.is_none() {
         return Redirect::to("/login").into_response();
+    }
+    // a read-only user looks: no action, nothing staged
+    if req.method() != Method::GET && path != "/logout" && user.as_deref().is_some_and(|u| app.auth.read_only(u)) {
+        return (StatusCode::FORBIDDEN, axum::Json(json!({"error": "this user may only look"}))).into_response();
     }
     let mut req = req;
     req.extensions_mut().insert(UserName(user.unwrap_or_default()));
@@ -206,7 +216,15 @@ async fn page(State(app): State<Shared>, req: axum::extract::Request) -> Respons
 
 // ---- privileged actions through doas
 
+/// Run octopus (as root through doas). The child belongs to a task of its
+/// own that reads its output to the end and keeps `held` (the action lock)
+/// until it exits: a closed browser tab, a reload or our own wait running
+/// out never leaves an apply without a reader or lets a second one start.
 async fn octopus(app: &App, args: &[&str]) -> (bool, String) {
+    run_owned(app, args, None).await
+}
+
+async fn run_owned(app: &App, args: &[&str], held: Option<tokio::sync::OwnedMutexGuard<()>>) -> (bool, String) {
     let mut cmd = if app.dev {
         let mut c = tokio::process::Command::new(std::env::var("OCTOPUS_BIN").unwrap_or_else(|_| "octopus".into()));
         c.args(args);
@@ -217,10 +235,17 @@ async fn octopus(app: &App, args: &[&str]) -> (bool, String) {
         c
     };
     cmd.stdin(std::process::Stdio::null()).kill_on_drop(false);
-    match tokio::time::timeout(Duration::from_secs(180), cmd.output()).await {
-        Err(_) => (false, "timed out after 180 s".into()),
-        Ok(Err(e)) => (false, format!("cannot run octopus: {e}")),
-        Ok(Ok(o)) => {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let r = cmd.output().await;
+        drop(held);
+        let _ = tx.send(r);
+    });
+    match tokio::time::timeout(Duration::from_secs(180), rx).await {
+        Err(_) => (false, "still running after 180 s; it carries on: see the status page for the outcome".into()),
+        Ok(Err(_)) => (false, "lost track of octopus; see the status page".into()),
+        Ok(Ok(Err(e))) => (false, format!("cannot run octopus: {e}")),
+        Ok(Ok(Ok(o))) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s += &String::from_utf8_lossy(&o.stderr);
             (o.status.success(), s)
@@ -229,10 +254,16 @@ async fn octopus(app: &App, args: &[&str]) -> (bool, String) {
 }
 
 async fn api_status(State(app): State<Shared>) -> Response {
-    if let Some((t, v)) = app.status.lock().unwrap().as_ref()
-        && t.elapsed() < Duration::from_secs(2)
-    {
-        return axum::Json(v.clone()).into_response();
+    let fresh = || {
+        app.status.lock().unwrap().as_ref().filter(|(t, _)| t.elapsed() < Duration::from_secs(2)).map(|x| x.1.clone())
+    };
+    if let Some(v) = fresh() {
+        return axum::Json(v).into_response();
+    }
+    let _one = app.status_run.lock().await;
+    // the run we waited for may have answered already
+    if let Some(v) = fresh() {
+        return axum::Json(v).into_response();
     }
     let (ok, out) = octopus(&app, &["status", "--json"]).await;
     if !ok {
@@ -386,6 +417,10 @@ async fn api_capture(State(app): State<Shared>, axum::Json(b): axum::Json<Captur
 #[derive(Deserialize)]
 struct ConfigBody {
     toml: String,
+    /// the router.toml the text was made from: an apply on top of a file
+    /// that changed since (another tab, user, the CLI) would undo that
+    #[serde(default)]
+    base: Option<String>,
 }
 
 /// Parse and bind to this machine's interfaces (by MAC).
@@ -449,7 +484,7 @@ fn stage(text: &str, user: &str) -> Result<(), String> {
     .map_err(|e| format!("stage: {e}"))
 }
 
-async fn staged_action(app: &App, req_user: &str, text: String, args: &[&str]) -> Response {
+async fn staged_action(app: &App, req_user: &str, text: String, base: Option<String>, args: &[&str]) -> Response {
     let t2 = text.clone();
     let (ok, diagnostics, _) =
         tokio::task::spawn_blocking(move || check_text(&t2)).await.unwrap_or((false, vec![], vec![]));
@@ -457,11 +492,20 @@ async fn staged_action(app: &App, req_user: &str, text: String, args: &[&str]) -
         return axum::Json(json!({"ok": false, "diagnostics": diagnostics, "output": "check failed", "diff": ""}))
             .into_response();
     }
-    let _g = app.action.lock().await;
+    let held = app.action.clone().lock_owned().await;
+    if let Some(b) = base
+        && std::fs::read_to_string(ROUTER_TOML).is_ok_and(|now| now != b)
+    {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"error": "router.toml changed on the router since this text was loaded (another tab, user or the CLI applied it): reload, then make the change again"})),
+        )
+            .into_response();
+    }
     if let Err(e) = stage(&text, req_user) {
         return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": e}))).into_response();
     }
-    let (ok, out) = octopus(app, args).await;
+    let (ok, out) = run_owned(app, args, Some(held)).await;
     *app.status.lock().unwrap() = None;
     axum::Json(json!({"ok": ok, "diagnostics": diagnostics, "output": out, "diff": out})).into_response()
 }
@@ -469,13 +513,13 @@ async fn staged_action(app: &App, req_user: &str, text: String, args: &[&str]) -
 async fn api_diff(State(app): State<Shared>, req: axum::extract::Request) -> Response {
     let user = user_of(req.extensions());
     let Ok(b) = body_json(req).await else { return StatusCode::BAD_REQUEST.into_response() };
-    staged_action(&app, &user, b.toml, &["diff", "--staged"]).await
+    staged_action(&app, &user, b.toml, None, &["diff", "--staged"]).await
 }
 
 async fn api_apply(State(app): State<Shared>, req: axum::extract::Request) -> Response {
     let user = user_of(req.extensions());
     let Ok(b) = body_json(req).await else { return StatusCode::BAD_REQUEST.into_response() };
-    staged_action(&app, &user, b.toml, &["apply", "--staged"]).await
+    staged_action(&app, &user, b.toml, b.base, &["apply", "--staged"]).await
 }
 
 async fn body_json(req: axum::extract::Request) -> Result<ConfigBody, ()> {
@@ -484,8 +528,12 @@ async fn body_json(req: axum::extract::Request) -> Result<ConfigBody, ()> {
 }
 
 async fn api_simple(app: &App, args: &[&str]) -> Response {
-    let _g = app.action.lock().await;
-    let (ok, out) = octopus(app, args).await;
+    let held = app.action.clone().lock_owned().await;
+    simple_held(app, args, held).await
+}
+
+async fn simple_held(app: &App, args: &[&str], held: tokio::sync::OwnedMutexGuard<()>) -> Response {
+    let (ok, out) = run_owned(app, args, Some(held)).await;
     *app.status.lock().unwrap() = None;
     axum::Json(json!({"ok": ok, "output": out.trim()})).into_response()
 }
@@ -503,6 +551,8 @@ async fn api_secret(State(app): State<Shared>, axum::Json(b): axum::Json<SecretB
         if app.dev { std::env::var("OCTOPUS_STAGED").unwrap_or_else(|_| "/tmp".into()) } else { STAGED_DIR.into() };
     let path = std::path::Path::new(&dir).join("secret.json");
     let body = json!({"key": b.key, "value": b.value}).to_string();
+    // staged under the action lock: another request's file is never ours
+    let held = app.action.clone().lock_owned().await;
     let staged = {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
@@ -518,9 +568,7 @@ async fn api_secret(State(app): State<Shared>, axum::Json(b): axum::Json<SecretB
         return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": format!("stage: {e}")})))
             .into_response();
     }
-    let r = api_simple(&app, &["secret", "--staged"]).await;
-    let _ = std::fs::remove_file(&path);
-    r
+    simple_held(&app, &["secret", "--staged"], held).await
 }
 
 #[derive(Deserialize)]
@@ -533,13 +581,12 @@ async fn api_guard_release(State(app): State<Shared>, axum::Json(b): axum::Json<
     let dir =
         if app.dev { std::env::var("OCTOPUS_STAGED").unwrap_or_else(|_| "/tmp".into()) } else { STAGED_DIR.into() };
     let path = std::path::Path::new(&dir).join("guard.json");
+    let held = app.action.clone().lock_owned().await;
     if let Err(e) = std::fs::write(&path, json!({"mac": b.mac}).to_string()) {
         return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": format!("stage: {e}")})))
             .into_response();
     }
-    let r = api_simple(&app, &["guard", "release", "--staged"]).await;
-    let _ = std::fs::remove_file(&path);
-    r
+    simple_held(&app, &["guard", "release", "--staged"], held).await
 }
 
 #[derive(Deserialize)]
@@ -703,7 +750,8 @@ fn run(conf_path: &str) -> Result<(), String> {
         own,
         auth,
         status: Mutex::new(None),
-        action: tokio::sync::Mutex::new(()),
+        status_run: tokio::sync::Mutex::new(()),
+        action: Arc::new(tokio::sync::Mutex::new(())),
         capture: tokio::sync::Mutex::new(()),
         traffic: Arc::new(traffic::Traffic::default()),
         dev: std::env::var_os("OCTOPUS_WEB_DEV").is_some(),

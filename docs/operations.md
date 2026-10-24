@@ -44,12 +44,14 @@ router from it; `rc.firsttime` applies router.toml.
    hash from `encrypt -b a`, SSH key). The partitioning question is left
    out so the installer picks MBR or GPT by how the stick was booted.
 2. `deploy/mkinstall-img.sh install79.img site79.tgz auto_install.conf
-   OUT.img` on the build VM: OpenBSD's installer image (signify-verified)
+   OUT.img` on the build VM: OpenBSD's installer image (checked against its SHA256.sig, which goes next to it)
    with the site set added and the answers in the ramdisk, console on com0.
    `dd` it to a stick.
 3. Boot the stick: it erases sd0 (the box's disk) and installs without
    asking. First boot applies `router.toml` from rc.firsttime
-   (`logger -t octopus-firstboot`).
+   (`logger -t octopus-firstboot`) with a 30-minute confirm window:
+   `octopus confirm` once it works, or it goes back to the installer's
+   network (generation 0) by itself.
 4. `octopus status`, `octopus generations`; generation 0 is the installer's
    files, generation 1 the configuration.
 
@@ -98,7 +100,14 @@ and the internal ranges, so leaves for any other name fail verification.
 `octopus pki renew` (daily from `/etc/daily.local`) issues the web UI's and
 each vhost's leaf (90 days; renewed 30 days before expiry or when names
 change) and reloads nginx / restarts the web UI. `octopus pki status` lists
-them. `octopus apply` issues missing leaves before validating.
+them. `octopus apply` issues missing leaves before validating. A leaf
+never outlives the intermediate. The intermediate's key must be root's
+alone (`chmod 600`); renew refuses to use it otherwise. `pki status` shows
+how long both CAs have left, and renew logs a warning from 60 days before
+either ends. Rollover: run `pki init` again into a new directory before the
+intermediate ends (or `pki init` with a new root after 10 years), install the
+new `root.crt` on the owner's devices next to the old one, then put the new
+intermediate on the router and `octopus pki renew --force`.
 
 A name the root doesn't cover (an address range added after `pki init`) is
 left out of the leaf and logged: a leaf outside the constraints fails
@@ -132,7 +141,18 @@ Install the certificate on the servers only (`AWS_CA_BUNDLE`,
 `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, Java keystores: design 13).
 Never on personal devices. `octopus-proxy` reads the key at start and hands
 it to its signer process; the process that talks to servers and origins
-never has it. Leaves last 7 days and are minted per allowed name.
+never has it. Leaves last 7 days and are minted per allowed name. The root
+excludes the internal zone and every address (its constraints): even its
+key can't impersonate the inside to the servers. It lasts 2 years (`pki
+status`): before then, move the old key and certificate aside, run
+`intercept-init` again, give the servers the new root next to the old one,
+and restart octopus_proxy.
+
+Plain HTTP goes to the name in Host, resolved by the router (internet
+addresses only), never to the address the server used: a forged Host
+reaches the allowed site, nothing else. Requests that name another host in
+their target, carry two Host headers, use CONNECT or ask for an upgrade are
+refused.
 
 ## Analyzer and flows
 
@@ -213,10 +233,20 @@ one interface, and Kea chooses by client class: a tier's `macs`, else the
 `octopus guard` (`octopus_guard`) reads the ARP table every 5 s. A device
 on an address of a tier with `macs` that isn't listed (MAC, prefix, or a
 reservation of that address) gets `rule block out on <vport> src <mac>` on
-the bridge: it can't reach the router any more, wherever it is plugged in.
+the bridge: it can't reach the router through the house ports' untagged
+interface any more. It still reaches other devices on the wire, and a
+device that changes its MAC or tags itself into a VLAN tier its port
+carries gets back in: the guard keeps honest devices in their tier, it is
+not a lock (router-toml.md, "What the tiers are not").
 `octopus guard status` lists them; `octopus guard release MAC` or the
 firewall page's "blocked devices" lifts it. The blocks survive restarts and
-are put back if the bridge is recreated.
+are put back if the bridge is recreated (an apply that rewrites the bridge
+leaves them off for the few seconds until the guard's next pass).
+
+One device can take a tier's whole DHCP pool by asking with made-up MACs
+(and a restricted tier's pool, with MACs under a listed prefix): list full
+MACs rather than prefixes where you can, and keep pools larger than the
+devices they serve.
 
 Before switching gw to tiers: every device that keeps a static CD address
 must be listed (its MAC prefix in `macs`, or a reservation), or the guard
@@ -243,6 +273,8 @@ joins in four steps:
    (firmware-selector.openwrt.org); the EAP620 HD is `tplink_eap620hd-v1`
    (25.12) or `tplink_eap620-hd-v2` / `-v3` (`snapshot`,
    qualcommax/ipq60xx) — check the label, each version has its own image.
+   The Image Builder's checksums are verified with OpenWrt's signature
+   (`gpg` with their release key imported; `AP_IMAGE_UNSIGNED=1` skips it).
    On Rocky Linux the Image Builder needs: `dnf install zstd unzip bzip2
    wget patch ncurses-devel zlib-devel perl-FindBin perl-Data-Dumper
    perl-File-Copy perl-File-Compare perl-Thread-Queue perl-Time-Piece
@@ -254,18 +286,60 @@ joins in four steps:
    under 63 characters).
 4. **Register** it: a reservation on the dhcp page (its mac, the address it
    should have), then the access point on the wifi page, and apply.
+5. **Trust** it, on the router as root: `octopus ap trust NAME` shows the
+   fingerprint of its SSH host key and pins it; compare it with the access
+   point's console (`dropbearkey -y -f /etc/dropbear/dropbear_ed25519_host_key`).
+   Until then nothing is pushed to it: its script holds the passphrases.
 
 Only OpenWrt access points can be managed this way. OpenWrt covers the
 EAP620 HD v1 (and v2/v3 in snapshots), the EAP610 v3 (as `tplink_eap613-v1`,
 ramips/mt7621) and the EAP610-Outdoor; not the EAP610 v1/v2 or the EAP110.
+The access point's SSH host key is pinned under its name
+(`/etc/octopus/ap.known_hosts`, `octopus-ap-NAME`), so a push never goes
+to whatever answers at its address, and the web UI can't pin one (an access
+point added there waits for `ap trust`). Pins made by address before this
+are taken over by name on the next push. After reflashing an access point,
+`octopus ap trust NAME` again. `octopus ap status` shows the last push of
+each; a script counts as taken on the access point only once its reload
+went through.
 
-The access point's SSH host key is pinned on first contact
-(`/etc/octopus/ap.known_hosts`); after reflashing one, delete its line.
-`octopus ap status` shows the last push of each.
+## Supervision
+
+Cron runs `octopus supervise` every 5 minutes (install.site adds it to
+root's crontab): an octopus daemon of the live generation that should run
+but doesn't (it aborts on a panic) is started again and logged. `octopus
+apply` refuses to start with less than 64 MB free in /var/octopus.
+
+## At boot
+
+`octopus boot` (from /etc/rc.local) does four things:
+
+* reverts a generation that was never confirmed (or whose apply never
+  finished): it was pending when the router went down;
+* checks that the physical ports are named as when the live generation was
+  applied (OpenBSD numbers them by the order it finds them, so a missing or
+  added NIC renumbers the rest, and the WAN cable could get a tier's
+  configuration). If not, it loads a lockdown ruleset (nothing from the WAN
+  port, found by its MAC; SSH to the router from elsewhere), takes the WAN
+  port out of the bridges, stops Kea and logs `LOCKED DOWN`: run
+  `octopus apply` from the console or over SSH, which binds the ports by MAC
+  again;
+* checks that pf runs the generated ruleset and loads it again if not (a
+  queue on a missing port makes pfctl refuse the whole file);
+* starts the DNS daemon first among the packages from then on (nginx
+  resolves its upstreams when it starts).
+
+ntpd starts before the DNS service and may only step the clock then: give
+`[ntp] servers` at least one address (check warns), or a clock that boots
+far off stays off, and DNS over TLS fails with it. With a DHCP WAN the ISP's
+DNS servers are ignored (`/etc/dhcpleased.conf`); resolvd stays off.
 
 ## Web UI users
 
-`/etc/octopus/web/users`: `name:bcrypt-hash` lines (mode 0640 root:_octoweb).
+`/etc/octopus/web/users`: `name:bcrypt-hash` lines (mode 0640 root:_octoweb);
+`name:bcrypt-hash:ro` for a user who may look but not change anything.
+Every other user is an administrator: applying a router.toml is
+root-equivalent (it decides what runs as root and what pf lets in).
 Make a hash with `octopus-web --hash` (password on stdin) or `encrypt -b a`.
 Restart `octopus_web` after editing. Sessions last 12 hours; five failed
 logins from one address lock it out for five minutes.
@@ -291,7 +365,8 @@ runs.
 |---|---|
 | errata | `syspatch`; kernel errata need a reboot |
 | nginx | `pkg_add -u nginx` |
-| OpenBSD release | upgrade the build VM, rebuild (`cargo build --release`, `deploy/build-hickory.sh`), run the validators against the router's config, build a new site set; `sysupgrade` the router, then `deploy/install-live.sh site80.tgz`, reboot |
+| OpenBSD release | upgrade the build VM, rebuild (`cargo build --release`, `deploy/build-hickory.sh`), run the validators against the router's config, build a new site set; `sysupgrade` the router, then `deploy/install-live.sh site80.tgz`, reboot. Between sysupgrade's reboot and install-live the old release's Octopus binaries and kea/nginx packages run on the new base: DNS and DHCP may be down for those minutes (sshd and pf are base and stay) |
+| Kea, nginx | `pkg_add -u kea nginx` (Kea parses DHCP from every tier as root: keep it current) |
 | Octopus | build a site set, `deploy/install-live.sh siteXY.tgz` on the router (keeps router.toml, secrets and web users), then `octopus apply` |
 
 ## Lab results

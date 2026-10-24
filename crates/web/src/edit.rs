@@ -106,7 +106,12 @@ pub fn apply(text: &str, e: &Edit) -> Result<String, String> {
         Edit::Firewall { rule, at } => {
             let cfg = octopus_config::parse(text)?;
             let replacing = at.as_ref().filter(|(l, _)| l == "forwards").map(|(_, i)| *i);
-            let (list, item) = crate::firewall::entry(&cfg, rule, replacing)?;
+            let (list, mut item) = crate::firewall::entry(&cfg, rule, replacing)?;
+            if let Some((l, i)) = at
+                && l == list
+            {
+                crate::firewall::keep(&cfg, list, *i, rule, &mut item);
+            }
             match at {
                 Some((l, i)) if l == list => tree::set(&mut doc, &[Seg::Key(l.clone()), Seg::Index(*i)], &item)?,
                 Some((l, i)) => {

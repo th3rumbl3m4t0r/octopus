@@ -64,6 +64,16 @@ fn q(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
 }
 
+/// Text for a `#` comment in router.toml: one line, whatever config.xml held.
+fn comment(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// A number from config.xml, or nothing (never raw text into router.toml).
+fn num<T: std::str::FromStr>(s: Option<String>) -> Option<T> {
+    s?.trim().parse().ok()
+}
+
 fn b64decode(s: &str) -> Option<String> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = vec![];
@@ -253,9 +263,13 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
     if let Some(w) = wan_if {
         let ppp =
             child(root, "ppps").and_then(|p| children(p, "ppp").find(|x| text(*x, "if").as_deref() == Some(&w.ifname)));
-        let mtu: u16 = text(*child(root, "interfaces").and_then(|i| child(i, "wan")).as_ref().unwrap(), "mtu")
+        let mut mtu: u16 = text(*child(root, "interfaces").and_then(|i| child(i, "wan")).as_ref().unwrap(), "mtu")
             .and_then(|m| m.parse().ok())
             .unwrap_or(1500);
+        if !(576..=9216).contains(&mtu) {
+            note(&mut rep, "change", format!("WAN MTU {mtu} is out of range; 1500 instead"));
+            mtu = 1500;
+        }
         let carrier = ppp.and_then(|p| text(p, "ports")).unwrap_or_else(|| w.ifname.clone());
         let (phys, vlan, prio) = match vlans.iter().find(|v| v.0 == carrier) {
             Some((_, parent, tag, pcp)) => (parent.clone(), Some(*tag), *pcp),
@@ -428,6 +442,21 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
     let mut fwd_toml = String::new();
     let mut fwd_targets: Vec<(Ipv4Addr, String)> = vec![];
     let reflect_default = text(sys, "enablenatreflectionpurenat").as_deref() == Some("yes");
+    // WAN filter rules: the pass rules a NAT rule is associated with, and the
+    // ones that stand alone (with their own source)
+    // (position among the filter rules, rule)
+    let wan_rules: Vec<(usize, N)> = child(root, "filter")
+        .map(|f| {
+            children(f, "rule")
+                .enumerate()
+                .filter(|(_, r)| !has(*r, "disabled") && text(*r, "interface").as_deref() == Some("wan"))
+                .map(|(i, r)| (i + 1, r))
+                .collect()
+        })
+        .unwrap_or_default();
+    // each forward: (WAN port, the filter position that passes it; None: the
+    // NAT rule passes it itself, ahead of every filter rule)
+    let mut fwd_passed: Vec<(String, Option<usize>)> = vec![];
     if let Some(nat) = child(root, "nat") {
         for (k, r) in children(nat, "rule").enumerate() {
             let descr = text(r, "descr").unwrap_or_default();
@@ -435,6 +464,37 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 note(&mut rep, "drop", format!("port forward {} is disabled", k + 1));
                 continue;
             }
+            // pfSense passes a forward's traffic only through a filter rule:
+            // its own (associated), "pass", or a separate one on the WAN
+            let target_txt = text(r, "target").unwrap_or_default();
+            let fport = port_of(child(r, "destination"));
+            let standalone = wan_rules.iter().find(|(_, w)| {
+                text(*w, "type").as_deref().unwrap_or("pass") == "pass"
+                    && text(*w, "associated-rule-id").is_none_or(|a| !a.starts_with("nat_"))
+                    && text(*w, "destination/address").as_deref() == Some(target_txt.as_str())
+                    && (port_of(child(*w, "destination")).is_none() || port_of(child(*w, "destination")) == fport)
+            });
+            // its own filter rule (it may have been deleted), else a WAN pass rule for it
+            let passed: Option<Option<usize>> = match text(r, "associated-rule-id").as_deref() {
+                Some("pass") => Some(None),
+                Some(id) if id.starts_with("nat_") => wan_rules
+                    .iter()
+                    .find(|(_, w)| text(*w, "associated-rule-id").as_deref() == Some(id))
+                    .or(standalone)
+                    .map(|(i, _)| Some(*i)),
+                _ => standalone.map(|(i, _)| Some(*i)),
+            };
+            let Some(passed_at) = passed else {
+                note(
+                    &mut rep,
+                    "drop",
+                    format!(
+                        "port forward {} ({descr}): no filter rule passes its traffic in pfSense (association None, no WAN pass rule), so it is closed there too",
+                        k + 1
+                    ),
+                );
+                continue;
+            };
             if text(r, "interface").as_deref() != Some("wan")
                 || text(r, "destination/network").as_deref() != Some("wanip")
             {
@@ -449,14 +509,39 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 note(&mut rep, "drop", format!("port forward {}: target is not an address", k + 1));
                 continue;
             };
-            let from = match endpoint(child(r, "source")) {
+            let mut from = match endpoint(child(r, "source")) {
                 Ok(f) => f.trim_start_matches("table:").to_string(),
                 Err(e) => {
                     note(&mut rep, "drop", format!("port forward {}: source {e} not supported", k + 1));
                     continue;
                 }
             };
+            // a separate WAN pass rule with a narrower source is what pfSense let in
+            if from == "any"
+                && let Some((_, w)) = standalone
+                && let Ok(src) = endpoint(child(*w, "source"))
+                && src != "any"
+            {
+                from = src.trim_start_matches("table:").to_string();
+                note(
+                    &mut rep,
+                    "info",
+                    format!("port forward {} ({descr}): source {from}, from the WAN rule that passes it", k + 1),
+                );
+            }
             let port = port_of(child(r, "destination")).unwrap_or_default();
+            if port.parse::<u16>().is_err()
+                && port
+                    .split_once(['-', ':'])
+                    .is_none_or(|(a, b)| a.parse::<u16>().is_err() || b.parse::<u16>().is_err())
+            {
+                note(
+                    &mut rep,
+                    "drop",
+                    format!("port forward {}: port {:?} is not a port or range", k + 1, comment(&port)),
+                );
+                continue;
+            }
             let local = text(r, "local-port").unwrap_or_else(|| port.clone());
             let proto = text(r, "protocol").unwrap_or_else(|| "tcp".into());
             let mut reflect = match text(r, "natreflection").as_deref() {
@@ -487,7 +572,16 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
             let _ = writeln!(fwd_toml, "proto = {}\nport = {}", q(&proto), port_value(&port));
             let _ = writeln!(fwd_toml, "from = {}\nto = {}", q(&from), q(&target.to_string()));
             if local != port {
-                let _ = writeln!(fwd_toml, "to_port = {local}");
+                match local.split(['-', ':']).next().and_then(|l| l.parse::<u16>().ok()) {
+                    Some(l) => {
+                        let _ = writeln!(fwd_toml, "to_port = {l}");
+                    }
+                    None => note(
+                        &mut rep,
+                        "change",
+                        format!("forward {name}: local port {:?} is not a port; dropped", comment(&local)),
+                    ),
+                }
             }
             if reflect {
                 let _ = writeln!(fwd_toml, "reflect = true");
@@ -496,11 +590,13 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 note(&mut rep, "info", format!("forward {name}: open to the whole internet"));
             }
             fwd_targets.push((target, port.clone()));
+            fwd_passed.push((port.clone(), passed_at));
         }
     }
 
     // ---- filter rules
     let mut rules: Vec<RuleOut> = vec![];
+    let mut wan_blocks: Vec<RuleOut> = vec![];
     let mut per_net: BTreeMap<String, Vec<RuleOut>> = BTreeMap::new();
     let mut dropped_disabled = 0;
     if let Some(f) = child(root, "filter") {
@@ -554,7 +650,7 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                         &mut rep,
                         "info",
                         format!(
-                            "WAN {what}: pass to {} port {}; covered by the forward to that host (the forward keeps its source restriction)",
+                            "WAN {what}: pass to {} port {}; covered by the forward to that host (its source is the forward's)",
                             dst.unwrap(),
                             dport.unwrap_or_default()
                         ),
@@ -562,7 +658,64 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                     continue;
                 }
                 if typ != "pass" {
-                    continue; // blocks are the default
+                    // a block that may come before a forward: kept, as a WAN
+                    // rule Octopus checks ahead of every way in
+                    let action = if typ == "reject" { "reject" } else { "block" };
+                    // Octopus checks WAN rules before every forward; pfSense only
+                    // before the forwards it passed later
+                    let bport = port_of(child(r, "destination"));
+                    let earlier: Vec<&String> = fwd_passed
+                        .iter()
+                        .filter(|(p, at)| at.is_none_or(|a| a < n) && ports_overlap(bport.as_deref(), p))
+                        .map(|(p, _)| p)
+                        .collect();
+                    if !earlier.is_empty() {
+                        note(
+                            &mut rep,
+                            "drop",
+                            format!(
+                                "WAN {what}: `{}` comes after the rules that pass the forwards on port(s) {} in pfSense; kept, it would block them",
+                                summary(r),
+                                earlier.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
+                            ),
+                        );
+                        continue;
+                    }
+                    match (endpoint(child(r, "source")), endpoint(child(r, "destination"))) {
+                        (Ok(from), Ok(to)) if !proto_of(r).as_deref().is_some_and(|p| p.starts_with('?')) => {
+                            note(
+                                &mut rep,
+                                "change",
+                                format!(
+                                    "WAN {what}: `{}` kept as a WAN {action} rule, ahead of every forward",
+                                    summary(r)
+                                ),
+                            );
+                            wan_blocks.push(RuleOut {
+                                network: "wan".into(),
+                                action,
+                                from,
+                                to,
+                                proto: proto_of(r),
+                                port: port_of(child(r, "destination")),
+                                log: has(r, "log"),
+                                descr: comment(&if descr.is_empty() {
+                                    format!("pfSense rule {n}")
+                                } else {
+                                    format!("pfSense rule {n}: {descr}")
+                                }),
+                            });
+                        }
+                        _ => note(
+                            &mut rep,
+                            "drop (security)",
+                            format!(
+                                "WAN {what}: `{}` can't be carried over; what it blocked may reach the forwards now",
+                                summary(r)
+                            ),
+                        ),
+                    }
+                    continue;
                 }
                 note(
                     &mut rep,
@@ -596,10 +749,12 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 "any" => true,
                 "self" => false,
                 f if f.starts_with("net:") => f == format!("net:{}", net.name),
-                f if f.starts_with("table:") => false,
+                // a table may hold hosts of this network
+                f if f.starts_with("table:") => true,
+                // a prefix that overlaps it (inside it, or around it)
                 f => f
                     .parse::<IpNet>()
-                    .map(|n| contains(&net.addr.trunc(), &n))
+                    .map(|n| overlaps(&net.addr.trunc(), &n))
                     .or_else(|_| f.parse::<Ipv4Addr>().map(|a| net.addr.trunc().contains(&a)))
                     .unwrap_or(false),
             };
@@ -617,6 +772,44 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 note(&mut rep, "drop", format!("{what}: protocol {}", proto.unwrap()));
                 continue;
             }
+            // qualifiers Octopus has no word for: a pass without them would be
+            // wider, a block without them is only stricter
+            let quals: Vec<&str> = [
+                ("source/port", "source port"),
+                ("sched", "schedule"),
+                ("gateway", "gateway"),
+                ("icmptype", "ICMP type"),
+                ("tagged", "tagged"),
+                ("tag", "tag"),
+                ("os", "OS"),
+                ("statetype", "state type"),
+                ("max-src-conn", "connection limits"),
+            ]
+            .into_iter()
+            // "keep state" is pfSense's default, not a qualifier
+            .filter(|(path, _)| text(r, path).is_some_and(|v| !(*path == "statetype" && v == "keep state")))
+            .map(|(_, what)| what)
+            .collect();
+            if !quals.is_empty() {
+                if action == "pass" {
+                    note(
+                        &mut rep,
+                        "drop (security)",
+                        format!(
+                            "{what} on {}: `{}` uses {}; without them it would pass more",
+                            net.name,
+                            summary(r),
+                            quals.join(", ")
+                        ),
+                    );
+                    continue;
+                }
+                note(
+                    &mut rep,
+                    "change",
+                    format!("{what} on {}: {} ignored, the {action} applies always", net.name, quals.join(", ")),
+                );
+            }
             let port = port_of(child(r, "destination"));
             per_net.entry(net.name.clone()).or_default().push(RuleOut {
                 network: net.name.clone(),
@@ -626,11 +819,11 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 proto,
                 port,
                 log: has(r, "log"),
-                descr: if descr.is_empty() {
+                descr: comment(&if descr.is_empty() {
                     format!("pfSense rule {n}")
                 } else {
                     format!("pfSense rule {n}: {descr}")
-                },
+                }),
             });
         }
     }
@@ -694,6 +887,7 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
         }
         rules.extend(kept);
     }
+    rules.extend(wan_blocks);
 
     // ---- DNS
     let mut upstreams = vec![];
@@ -753,8 +947,8 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
     let _ = writeln!(
         out,
         "# Octopus router.toml, imported from pfSense {}.{}.",
-        text(sys, "hostname").unwrap_or_default(),
-        domain
+        comment(&text(sys, "hostname").unwrap_or_default()),
+        comment(&domain)
     );
     out += "# Read the import report before applying. Secrets are in secrets.toml.\n\n";
     let _ = writeln!(
@@ -765,7 +959,12 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
         q(&text(sys, "timezone").unwrap_or_else(|| "UTC".into()))
     );
     if let Some(m) = text(sys, "maximumtableentries") {
-        let _ = writeln!(out, "max_table_entries = {m}");
+        match num::<u32>(Some(m.clone())) {
+            Some(m) => {
+                let _ = writeln!(out, "max_table_entries = {m}");
+            }
+            None => note(&mut rep, "drop", format!("maximumtableentries {:?} is not a number", comment(&m))),
+        }
     }
     out += "\n# Ports by role, bound to MAC addresses. `name` is the pfSense name, used\n# only when compiling off the router.\n";
     for (ifname, role) in &roles {
@@ -814,7 +1013,7 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
             if c.is_empty() || c.starts_with("Entry added") {
                 let _ = writeln!(out, "  {},", q(e));
             } else {
-                let _ = writeln!(out, "  {},\t# {}", q(e), c.replace('\n', " "));
+                let _ = writeln!(out, "  {},\t# {}", q(e), comment(c));
             }
         }
         out += "]\n";
@@ -859,7 +1058,7 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
         child(root, "ntpd").is_some_and(|n| text(n, "enable").as_deref() == Some("enabled") || has(n, "interface"));
     let _ = writeln!(out, "\n[ntp]\nservers = [{}]\nserve = {serve}", ntp.join(", "));
 
-    let port = child(sys, "ssh").and_then(|s| text(s, "port")).unwrap_or_else(|| "22".into());
+    let port: u16 = num(child(sys, "ssh").and_then(|s| text(s, "port"))).unwrap_or(22);
     let _ = writeln!(
         out,
         "\n[ssh]\nport = {port}\npassword_auth = false\t# deploy keys in deploy/authorized_keys before cutover"
@@ -893,8 +1092,8 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
         let _ = writeln!(
             out,
             "# [traffic]\n# upload = \"{up}M\"\t# pfSense WAN root: {}\n# download = \"{down}M\"\t# pfSense LAN upper limit: {}",
-            wan_bw.unwrap_or_default(),
-            lan_up.unwrap_or_default()
+            comment(&wan_bw.unwrap_or_default()),
+            comment(&lan_up.unwrap_or_default())
         );
         note(&mut rep, "todo", "traffic shaper (PRIQ upload, HFSC download, wizard port rules) not imported; [traffic] is left commented with pfSense's rates".into());
     }
@@ -916,13 +1115,15 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                 continue;
             };
             let (Some(addr), Some(port)) = (text(server, "address"), text(server, "port")) else { continue };
+            // commented lines: nothing in them may start a new one
+            let (name, addr, port) = (comment(&name), comment(&addr), comment(&port));
             let scheme = if text(server, "ssl").as_deref() == Some("yes") { "https" } else { "http" };
             let ca = text(server, "ssl-server-ca").and_then(|r| ca_names.get(&r).cloned());
             names.push(format!("{name} -> {scheme}://{addr}:{port}"));
             let _ = writeln!(
                 blocks,
                 "\n# haproxy frontend {name:?} ({}) -> {addr}:{port}",
-                text(b, "descr").unwrap_or_default()
+                comment(&text(b, "descr").unwrap_or_default())
             );
             let _ = writeln!(blocks, "# [[vhosts]]\n# name = {}", q(&ident(&name, 20).replace('_', "-")));
             let _ = writeln!(blocks, "# upstream = \"{scheme}://{addr}:{port}\"");
@@ -932,8 +1133,9 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
                     Some(c) => {
                         let _ = writeln!(
                             blocks,
-                            "# upstream_ca = \"/etc/octopus/pki/upstream/{}.crt\"\t# pfSense CA {c:?}: export it from pfSense",
-                            ident(c, 40)
+                            "# upstream_ca = \"/etc/octopus/pki/upstream/{}.crt\"\t# pfSense CA {:?}: export it from pfSense",
+                            ident(c, 40),
+                            comment(c)
                         );
                     }
                     None => blocks.push_str("# verify_upstream = false\t# haproxy didn't check this upstream\n"),
@@ -989,6 +1191,38 @@ pub fn import_with(xml: &str, macs: &BTreeMap<String, String>) -> Result<Import,
         note(&mut rep, "change", "pfSense had IPv6 on some networks (track6/SLAAC). Octopus imports it as off (blocked completely) until prefix delegation is implemented; owner decision (design 21).".into());
     }
 
+    // sections this importer doesn't carry over: said, not silently lost
+    let staticmaps = child(root, "dhcpd")
+        .map(|d| d.descendants().filter(|n| n.tag_name().name() == "staticmap").count())
+        .unwrap_or(0);
+    if staticmaps > 0 {
+        note(
+            &mut rep,
+            "todo",
+            format!("{staticmaps} DHCP static mapping(s) aren't imported: add them as [[hosts]] with mac"),
+        );
+    }
+    for (path, what) in [
+        ("installedpackages/wireguard", "WireGuard tunnels"),
+        ("ipsec/phase1", "IPsec tunnels"),
+        ("openvpn/openvpn-server", "OpenVPN servers"),
+        ("openvpn/openvpn-client", "OpenVPN clients"),
+        ("nat/outbound/rule", "outbound NAT rules"),
+        ("nat/onetoone", "1:1 NAT"),
+        ("staticroutes/route", "static routes"),
+    ] {
+        if at(root, path).is_some() {
+            note(
+                &mut rep,
+                "todo",
+                format!("{what} aren't imported; set them up by hand ([wireguard], [[routes]], ...)"),
+            );
+        }
+    }
+    if text(at(root, "ppps/ppp").unwrap_or(root), "password").is_some() && !secrets.contains("pppoe_pass") {
+        note(&mut rep, "todo", "the PPPoE password didn't decode: import the unredacted config.xml".into());
+    }
+
     out += &vhost_toml;
     Ok(Import { router_toml: out, secrets, report: rep })
 }
@@ -997,9 +1231,25 @@ pub fn import(xml: &str) -> Result<Import, String> {
     import_with(xml, &BTreeMap::new())
 }
 
-fn contains(net: &Ipv4Net, n: &IpNet) -> bool {
+/// Do a port (None: all of them) and a forward's port or range share a port?
+fn ports_overlap(a: Option<&str>, b: &str) -> bool {
+    let range = |p: &str| -> Option<(u16, u16)> {
+        match p.split_once(['-', ':']) {
+            Some((x, y)) => Some((x.trim().parse().ok()?, y.trim().parse().ok()?)),
+            None => p.trim().parse().ok().map(|x| (x, x)),
+        }
+    };
+    match (a.map(range), range(b)) {
+        (None, _) => true,
+        (Some(Some((a1, a2))), Some((b1, b2))) => a1 <= b2 && b1 <= a2,
+        // something we can't read: assume it does
+        _ => true,
+    }
+}
+
+fn overlaps(net: &Ipv4Net, n: &IpNet) -> bool {
     match n {
-        IpNet::V4(x) => net.contains(x),
+        IpNet::V4(x) => net.contains(x) || x.contains(net),
         IpNet::V6(_) => false,
     }
 }
@@ -1047,4 +1297,65 @@ fn summary(r: N) -> String {
         side(child(r, "source")),
         side(child(r, "destination"))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    const XML: &str = r#"<?xml version="1.0"?>
+<pfsense>
+  <system><hostname>fw</hostname><domain>home.arpa</domain>
+    <maximumtableentries>400000
+[[forwards]]
+name = "x"</maximumtableentries>
+  </system>
+  <interfaces>
+    <wan><if>igc0</if><enable/><mtu>20</mtu><ipaddr>dhcp</ipaddr></wan>
+    <lan><if>igc1</if><enable/><descr>LAN</descr><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+    <opt1><if>igc2</if><enable/><descr>KIDS</descr><ipaddr>10.10.0.1</ipaddr><subnet>24</subnet></opt1>
+  </interfaces>
+  <aliases><alias><name>consoles</name><type>host</type><address>10.10.0.50 10.10.0.51</address></alias></aliases>
+  <nat>
+    <rule><source><any/></source><destination><network>wanip</network><port>443</port></destination>
+      <protocol>tcp</protocol><target>192.168.1.10</target><local-port>443</local-port><interface>wan</interface>
+      <descr>web</descr><associated-rule-id>nat_1</associated-rule-id></rule>
+    <rule><source><any/></source><destination><network>wanip</network><port>8080</port></destination>
+      <protocol>tcp</protocol><target>192.168.1.11</target><local-port>8080</local-port><interface>wan</interface>
+      <descr>closed</descr><associated-rule-id></associated-rule-id></rule>
+  </nat>
+  <filter>
+    <rule><type>block</type><interface>wan</interface><source><address>203.0.113.0/24</address></source><destination><any/></destination></rule>
+    <rule><type>pass</type><interface>wan</interface><protocol>tcp</protocol><source><any/></source>
+      <destination><address>192.168.1.10</address><port>443</port></destination><associated-rule-id>nat_1</associated-rule-id></rule>
+    <rule><type>block</type><interface>opt1</interface><source><address>consoles</address></source><destination><any/></destination></rule>
+    <rule><type>block</type><interface>opt1</interface><source><address>10.0.0.0/8</address></source><destination><address>192.168.1.0/24</address></destination></rule>
+    <rule><type>pass</type><interface>opt1</interface><protocol>udp</protocol><source><any/><port>123</port></source><destination><any/></destination></rule>
+    <rule><type>pass</type><interface>opt1</interface><source><network>opt1</network></source><destination><any/></destination><sched>school</sched></rule>
+    <rule><type>pass</type><interface>opt1</interface><source><network>opt1</network></source><destination><any/></destination></rule>
+  </filter>
+</pfsense>"#;
+
+    #[test]
+    fn faithful_where_it_matters() {
+        let i = super::import(XML).unwrap();
+        let t = &i.router_toml;
+        let report = i.report.join("\n");
+        // it parses, and nothing from a value became a key or a table
+        let doc: toml::Table = t.parse().unwrap_or_else(|e| panic!("{e}\n{t}"));
+        assert!(doc["system"].get("max_table_entries").is_none(), "{t}");
+        assert!(!t.contains("name = \"x\""), "{t}");
+        assert!(t.contains("mtu = 1500"), "{t}");
+        // blocks from an alias and from a wider prefix stay
+        assert!(t.contains("from = \"table:consoles\""), "{t}");
+        assert!(t.contains("from = \"10.0.0.0/8\""), "{t}");
+        // the WAN block before the forward is kept; the forward nothing passes isn't made
+        assert!(t.contains("network = \"wan\"\naction = \"block\"\nfrom = \"203.0.113.0/24\""), "{t}");
+        assert!(!t.contains("192.168.1.11"), "{t}");
+        assert!(report.contains("no filter rule passes its traffic"));
+        // passes with a source port or a schedule aren't widened into pass-everything
+        assert!(!t.contains("description = \"pfSense rule 5\""), "{t}");
+        assert!(!t.contains("description = \"pfSense rule 6\""), "{t}");
+        assert!(report.contains("source port") && report.contains("schedule"), "{report}");
+        // and the plain pass after them still counts
+        assert!(t.contains("pfSense rule 7") || !report.contains("shadowed"), "{report}");
+    }
 }

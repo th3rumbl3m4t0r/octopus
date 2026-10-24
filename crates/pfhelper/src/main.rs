@@ -5,9 +5,13 @@
 //!   {"table": "cls_streaming", "op": "add", "addresses": ["192.0.2.1", "2001:db8::/64"]}
 //!
 //! and answers `{"ok": true, "count": N}` or `{"ok": false, "error": "..."}`.
-//! Tables must be on the allowlist; every address must be one host or
-//! prefix. It runs `pfctl -t TABLE -T OP -f -` and logs every action. After
-//! setup it is pledged to stdio/unix/proc/exec and can only execute pfctl.
+//! Each client may write its own tables only (octopus-dns the cls_* ones,
+//! the analyzer lab_block); every address must be one host or prefix, and
+//! lab_block takes single addresses outside the protected prefixes of
+//! /etc/octopus/pfhelper.conf. It runs `pfctl -t TABLE -T OP -f -` and logs
+//! every action; lab_block entries also expire in pf itself. Clients are
+//! served side by side, with timeouts. After setup it is pledged to
+//! stdio/unix/proc/exec and can only execute pfctl.
 //!
 //! This file is privileged code: keep it small and review every change.
 
@@ -15,11 +19,17 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use octopus_pfhelper::{DEFAULT_TABLES, parse};
+use ipnet::IpNet;
+use octopus_pfhelper::{Config, DEFAULT_TABLES, Grant, LAB_BLOCK, parse, tables_for};
 
 const SOCKET: &str = "/var/run/octopus-pfhelper.sock";
+const CONF: &str = "/etc/octopus/pfhelper.conf";
+/// Clients served at once (each is a thread).
+const MAX_CLIENTS: usize = 16;
 const PFCTL: &str = "/sbin/pfctl";
 /// The socket's group; its members may connect.
 const CLIENT_GROUP: &str = "_octodns";
@@ -63,21 +73,37 @@ fn pfctl(table: &str, op: &str, addrs: &[String]) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("pfctl failed: {}", err.trim())) }
 }
 
-fn handle(stream: UnixStream, tables: &[String], allowed_uids: &[u32]) {
+struct Shared {
+    tables: Vec<String>,
+    /// uid -> the tables it may write
+    clients: Vec<(u32, Vec<String>)>,
+    protected: Vec<IpNet>,
+    /// one pfctl at a time
+    pf: Mutex<()>,
+    active: AtomicUsize,
+}
+
+fn handle(stream: UnixStream, sh: &Shared) {
     let peer = peer_ids(&stream);
-    let ok_peer = match peer {
-        Some((uid, _)) => uid == 0 || allowed_uids.contains(&uid),
-        None => !cfg!(target_os = "openbsd"),
+    let mine: Vec<String> = match peer {
+        Some((uid, _)) => sh.clients.iter().find(|(u, _)| *u == uid).map(|(_, t)| t.clone()).unwrap_or_default(),
+        None if !cfg!(target_os = "openbsd") => sh.tables.clone(),
+        None => vec![],
     };
+    // and only those the command line left on
+    let mine: Vec<String> = mine.into_iter().filter(|t| sh.tables.contains(t)).collect();
     let mut w = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
     };
-    if !ok_peer {
+    // a client that stops reading can't hold a thread forever
+    let _ = w.set_write_timeout(Some(Duration::from_secs(5)));
+    if mine.is_empty() {
         log(&format!("refused peer {peer:?}"));
         let _ = writeln!(w, "{}", serde_json::json!({"ok": false, "error": "not allowed"}));
         return;
     }
+    let grant = Grant { tables: &mine, protected: &sh.protected };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut r = BufReader::new(stream.take(MAX_LINE as u64 * 16));
     let mut line = String::new();
@@ -91,31 +117,55 @@ fn handle(stream: UnixStream, tables: &[String], allowed_uids: &[u32]) {
             let _ = writeln!(w, "{}", serde_json::json!({"ok": false, "error": "line too long"}));
             return;
         }
-        let reply = match parse(&line, tables) {
+        let reply = match parse(&line, &grant) {
             Err(e) => {
                 log(&format!("rejected request from {peer:?}: {e}"));
                 serde_json::json!({"ok": false, "error": e})
             }
-            Ok((table, op, addrs)) => match pfctl(&table, op, &addrs) {
-                Ok(()) => {
-                    let sample: Vec<&str> = addrs.iter().take(4).map(String::as_str).collect();
-                    log(&format!(
-                        "{op} {table}: {} address(es) {}{}",
-                        addrs.len(),
-                        sample.join(" "),
-                        if addrs.len() > 4 { " ..." } else { "" }
-                    ));
-                    serde_json::json!({"ok": true, "count": addrs.len()})
+            Ok((table, op, addrs)) => {
+                let done = {
+                    let _pf = sh.pf.lock().unwrap_or_else(|e| e.into_inner());
+                    pfctl(&table, op, &addrs)
+                };
+                match done {
+                    Ok(()) => {
+                        let sample: Vec<&str> = addrs.iter().take(4).map(String::as_str).collect();
+                        log(&format!(
+                            "{op} {table}: {} address(es) {}{}",
+                            addrs.len(),
+                            sample.join(" "),
+                            if addrs.len() > 4 { " ..." } else { "" }
+                        ));
+                        serde_json::json!({"ok": true, "count": addrs.len()})
+                    }
+                    Err(e) => {
+                        log(&format!("{op} {table}: {e}"));
+                        serde_json::json!({"ok": false, "error": e})
+                    }
                 }
-                Err(e) => {
-                    log(&format!("{op} {table}: {e}"));
-                    serde_json::json!({"ok": false, "error": e})
-                }
-            },
+            }
         };
         if writeln!(w, "{reply}").is_err() {
             return;
         }
+    }
+}
+
+/// pfctl -T expire: lab blocks end in pf even when the analyzer that made
+/// them was restarted, stopped or lost its delete.
+fn expire_lab_blocks(sh: &Shared, secs: u32) {
+    let _pf = sh.pf.lock().unwrap_or_else(|e| e.into_inner());
+    // pipes, not /dev/null: opening a file would need more pledge promises
+    let out = Command::new(PFCTL)
+        .args(["-q", "-t", LAB_BLOCK, "-T", "expire", &secs.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    if let Ok(o) = out
+        && !o.status.success()
+    {
+        log(&format!("expire {LAB_BLOCK}: {}", String::from_utf8_lossy(&o.stderr).trim()));
     }
 }
 
@@ -184,6 +234,19 @@ fn main() {
             }
         }
     }
+    // before pledge: no file access afterwards
+    let conf: Config = match std::fs::read_to_string(CONF) {
+        Ok(t) => toml::from_str(&t).unwrap_or_else(|e| {
+            log(&format!("{CONF}: {e}"));
+            std::process::exit(1);
+        }),
+        Err(_) => Config { protected: vec![], lab_block_expire: 3600 },
+    };
+    let mut clients: Vec<(u32, Vec<String>)> = CLIENT_USERS
+        .iter()
+        .filter_map(|u| uid_of(u).map(|id| (id, tables_for(u).iter().map(|t| t.to_string()).collect())))
+        .collect();
+    clients.push((0, tables_for("root").iter().map(|t| t.to_string()).collect()));
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).unwrap_or_else(|e| {
         log(&format!("{socket}: {e}"));
@@ -194,11 +257,35 @@ fn main() {
         let _ = std::os::unix::fs::chown(&socket, Some(0), Some(g));
     }
     let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660));
-    // before pledge: no file access afterwards
-    let uids: Vec<u32> = CLIENT_USERS.iter().filter_map(|u| uid_of(u)).collect();
     sandbox();
-    log(&format!("listening on {socket}; tables {}", tables.join(",")));
+    let sh = Arc::new(Shared {
+        tables,
+        clients,
+        protected: conf.protected,
+        pf: Mutex::new(()),
+        active: AtomicUsize::new(0),
+    });
+    log(&format!("listening on {socket}; tables {}; {} protected prefix(es)", sh.tables.join(","), sh.protected.len()));
+    if sh.tables.iter().any(|t| t == LAB_BLOCK) {
+        let sh = sh.clone();
+        let secs = conf.lab_block_expire.max(60);
+        std::thread::spawn(move || {
+            loop {
+                expire_lab_blocks(&sh, secs);
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
+    }
     for s in listener.incoming().flatten() {
-        handle(s, &tables, &uids);
+        if sh.active.load(Ordering::SeqCst) >= MAX_CLIENTS {
+            log("too many clients; refusing one");
+            continue;
+        }
+        sh.active.fetch_add(1, Ordering::SeqCst);
+        let sh = sh.clone();
+        std::thread::spawn(move || {
+            handle(s, &sh);
+            sh.active.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }

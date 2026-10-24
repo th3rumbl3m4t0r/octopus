@@ -489,6 +489,11 @@ pub struct Network {
     /// the ports of an untagged bridge, e.g. guests on the same access
     /// points); untagged when absent.
     pub vlan: Option<u16>,
+    /// The house ports ([lan] roles) that carry this VLAN tier; default:
+    /// every one. A device on a port that carries it can join it by tagging
+    /// its frames, so list only the access points' ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<String>,
     /// Router address and prefix, e.g. `192.168.1.1/24`.
     #[schemars(with = "String")]
     pub address: Ipv4Net,
@@ -802,21 +807,42 @@ pub struct Ssh {
     pub port: u16,
     #[serde(default)]
     pub password_auth: bool,
-    #[serde(default = "default_root_login")]
-    pub root_login: String,
+    /// sshd's PermitRootLogin.
+    #[serde(default)]
+    pub root_login: RootLogin,
 }
 
 impl Default for Ssh {
     fn default() -> Self {
-        Ssh { port: default_ssh_port(), password_auth: false, root_login: default_root_login() }
+        Ssh { port: default_ssh_port(), password_auth: false, root_login: RootLogin::default() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootLogin {
+    Yes,
+    No,
+    /// Keys only.
+    #[default]
+    ProhibitPassword,
+    /// Keys with a forced command only.
+    ForcedCommandsOnly,
+}
+
+impl RootLogin {
+    pub fn name(self) -> &'static str {
+        match self {
+            RootLogin::Yes => "yes",
+            RootLogin::No => "no",
+            RootLogin::ProhibitPassword => "prohibit-password",
+            RootLogin::ForcedCommandsOnly => "forced-commands-only",
+        }
     }
 }
 
 fn default_ssh_port() -> u16 {
     22
-}
-fn default_root_login() -> String {
-    "prohibit-password".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]

@@ -26,8 +26,25 @@ pub fn key_of(s: &str) -> Option<&str> {
 }
 
 impl Secrets {
+    /// Read a secrets file: a plain file of whoever runs this (root on the
+    /// router), nobody else allowed to read it (INV-8).
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let m = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+        if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{}: INV-8: secrets must be a file of yours that nobody else can read (chmod 600)",
+                path.display()
+            ));
+        }
+        let mut text = String::new();
+        f.read_to_string(&mut text).map_err(|e| format!("{}: {e}", path.display()))?;
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 

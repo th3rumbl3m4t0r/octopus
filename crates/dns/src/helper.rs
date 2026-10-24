@@ -17,20 +17,22 @@ impl Helper {
         Helper { path: path.to_string(), conn: Mutex::new(None) }
     }
 
+    /// One request, all of it (waiting for the connection included) within `wait`.
     pub async fn request(&self, table: &str, op: &str, addresses: &[String], wait: Duration) -> Result<(), String> {
         let line = serde_json::json!({"table": table, "op": op, "addresses": addresses}).to_string() + "\n";
-        match tokio::time::timeout(wait, self.exchange(&line)).await {
-            Err(_) => {
-                // the reply may still come; don't let it pair with the next request
-                *self.conn.lock().await = None;
-                Err("timed out".into())
-            }
-            Ok(r) => r,
-        }
+        tokio::time::timeout(wait, self.exchange(&line)).await.unwrap_or_else(|_| Err("timed out".into()))
     }
 
     async fn exchange(&self, line: &str) -> Result<(), String> {
-        let mut guard = self.conn.lock().await;
+        // dropped halfway (the caller's deadline), the connection may still get
+        // this reply: it goes with the guard, before the next request has it
+        let mut guard = Reset(self.conn.lock().await, false);
+        let r = self.exchange_on(&mut guard.0, line).await;
+        guard.1 = true;
+        r
+    }
+
+    async fn exchange_on(&self, guard: &mut Option<BufReader<UnixStream>>, line: &str) -> Result<(), String> {
         for attempt in 0..2 {
             if guard.is_none() {
                 let s = UnixStream::connect(&self.path).await.map_err(|e| format!("{}: {e}", self.path))?;
@@ -55,5 +57,16 @@ impl Helper {
             };
         }
         Err("unreachable".into())
+    }
+}
+
+/// The connection, reset unless the exchange that holds it finished.
+struct Reset<'a>(tokio::sync::MutexGuard<'a, Option<BufReader<UnixStream>>>, bool);
+
+impl Drop for Reset<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            *self.0 = None;
+        }
     }
 }

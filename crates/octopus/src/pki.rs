@@ -52,16 +52,41 @@ pub fn init(r: &Router, out: &Path) -> Res<()> {
     w("root.key", &root.key_pem, 0o600)?;
     w("intermediate.crt", &inter.cert_pem, 0o644)?;
     w("intermediate.key", &inter.key_pem, 0o600)?;
-    println!("services root for {} ({} address ranges) in {}", c.dns.join(", "), c.ips.len(), out.display());
-    println!("router: copy root.crt, intermediate.crt, intermediate.key to {DIR}/ (key mode 0600)");
-    println!("offline: keep root.key; install root.crt on the owner's devices");
+    out!("services root for {} ({} address ranges) in {}", c.dns.join(", "), c.ips.len(), out.display());
+    out!("router: copy root.crt, intermediate.crt, intermediate.key to {DIR}/ (key mode 0600)");
+    out!("offline: keep root.key; install root.crt on the owner's devices");
     Ok(())
 }
 
-fn intermediate() -> Option<Ca> {
-    let cert_pem = fs::read_to_string(format!("{DIR}/intermediate.crt")).ok()?;
-    let key_pem = fs::read_to_string(format!("{DIR}/intermediate.key")).ok()?;
-    Some(Ca { cert_pem, key_pem })
+/// The intermediate, if its key is root's alone: one anybody else could
+/// read is not used (anyone holding it can vouch for the internal zone).
+fn intermediate() -> Res<Ca> {
+    use std::os::unix::fs::MetadataExt;
+    let key = format!("{DIR}/intermediate.key");
+    let m = fs::metadata(&key).map_err(|e| format!("{key}: {e}"))?;
+    if m.uid() != 0 || m.mode() & 0o077 != 0 {
+        return Err(format!("{key} must be root's alone (chown root {key}; chmod 600 {key}); not using it"));
+    }
+    let cert_pem =
+        fs::read_to_string(format!("{DIR}/intermediate.crt")).map_err(|e| format!("{DIR}/intermediate.crt: {e}"))?;
+    let key_pem = fs::read_to_string(&key).map_err(|e| format!("{key}: {e}"))?;
+    Ok(Ca { cert_pem, key_pem })
+}
+
+/// Warn about a CA certificate that ends soon (None: fine or unreadable).
+fn ca_expiry(path: &str) -> Option<String> {
+    let pem = fs::read_to_string(path).ok()?;
+    let end = octopus_pki::not_after(&pem).ok()?;
+    let days = (end - now() as i64) / 86400;
+    (days < 60).then(|| {
+        if days < 0 {
+            format!(
+                "{path} has EXPIRED: certificates it issued no longer verify; make a new one (docs/operations.md, PKI)"
+            )
+        } else {
+            format!("{path} expires in {days} days: make a new one before then (docs/operations.md, PKI)")
+        }
+    })
 }
 
 pub fn present() -> bool {
@@ -139,7 +164,18 @@ pub fn renew(r: &Router, force: bool, missing_only: bool) -> Res<Vec<&'static st
         }
         return Ok(reload);
     }
-    let inter = intermediate().ok_or("cannot read the intermediate")?;
+    let inter = match intermediate() {
+        Ok(i) => i,
+        Err(e) => {
+            log(&format!("pki: {e}"));
+            return Ok(reload);
+        }
+    };
+    for w in [format!("{DIR}/intermediate.crt"), octopus_render::proxy::CA_CERT.to_string()] {
+        if let Some(msg) = ca_expiry(&w) {
+            log(&format!("pki: {msg}"));
+        }
+    }
     let permitted = octopus_pki::permitted(&inter.cert_pem)?;
     fs::create_dir_all(LEAF_DIR).map_err(|e| format!("{LEAF_DIR}: {e}"))?;
     for w in &ws {
@@ -176,11 +212,18 @@ pub fn renew(r: &Router, force: bool, missing_only: bool) -> Res<Vec<&'static st
             continue;
         }
         let leaf = octopus_pki::issue(&inter, &w.dns, &w.ips, DAYS)?;
-        os::write_atomic(&w.key, leaf.key_pem.as_bytes(), w.key_mode, "root", w.group)?;
-        os::write_atomic(&w.cert, leaf.chain_pem.as_bytes(), 0o644, "root", w.group)?;
+        os::write_atomic_all(&[
+            (&w.key, leaf.key_pem.as_bytes(), w.key_mode, "root", w.group),
+            (&w.cert, leaf.chain_pem.as_bytes(), 0o644, "root", w.group),
+        ])?;
         let m = Meta { names: names(w), not_after: leaf.not_after };
         os::write_atomic(&meta_path(w), serde_json::to_string(&m).unwrap().as_bytes(), 0o644, "root", "wheel")?;
-        log(&format!("pki: issued {} for {} (90 days)", w.cert.display(), names(w).join(" ")));
+        log(&format!(
+            "pki: issued {} for {} ({} days)",
+            w.cert.display(),
+            names(w).join(" "),
+            (leaf.not_after - now() as i64) / 86400
+        ));
         if !reload.contains(&w.service) {
             reload.push(w.service);
         }
@@ -266,36 +309,54 @@ fn acme(r: &Router, missing_only: bool) -> Res<Vec<&'static str>> {
 
 /// The interception root (design 14): made on the router, key readable by
 /// root only. octopus-proxy reads it at start and hands it to its signer
-/// process; the part that talks to servers and origins never has it. No name
-/// constraints are possible (it must vouch for any allowed name), so only
-/// servers may trust it.
+/// process; the part that talks to servers and origins never has it. It
+/// must vouch for any allowed name, so its constraints only exclude: the
+/// internal zone and every address. Only servers may trust it.
 pub fn intercept_init(r: &Router) -> Res<()> {
     use octopus_render::proxy::{CA_CERT, CA_KEY};
     r.cfg.proxy.as_ref().ok_or("router.toml has no [proxy]")?;
     if Path::new(CA_KEY).exists() {
         return Err(format!("{CA_KEY} exists; refusing to replace the interception root"));
     }
-    let ca = octopus_pki::new_intercept_root()?;
-    os::write_atomic(Path::new(CA_KEY), ca.key_pem.as_bytes(), 0o600, "root", "wheel")?;
-    os::write_atomic(Path::new(CA_CERT), ca.cert_pem.as_bytes(), 0o644, "root", "wheel")?;
+    let ca = octopus_pki::new_intercept_root(std::slice::from_ref(&r.cfg.system.domain))?;
+    os::write_atomic_all(&[
+        (Path::new(CA_KEY), ca.key_pem.as_bytes(), 0o600, "root", "wheel"),
+        (Path::new(CA_CERT), ca.cert_pem.as_bytes(), 0o644, "root", "wheel"),
+    ])?;
     log("pki: made the interception root (servers only)");
-    println!("interception root: {CA_CERT} (give it to the servers, never to personal devices)");
+    out!("interception root: {CA_CERT} (give it to the servers, never to personal devices)");
     Ok(())
 }
 
 pub fn status(r: &Router) {
+    for (what, path) in [
+        ("services intermediate", format!("{DIR}/intermediate.crt")),
+        ("interception root", octopus_render::proxy::CA_CERT.to_string()),
+    ] {
+        if let Some(end) = fs::read_to_string(&path).ok().and_then(|p| octopus_pki::not_after(&p).ok()) {
+            out!("{what:<34} {:>4} days left  {path}", (end - now() as i64) / 86400);
+        }
+        if let Some(msg) = ca_expiry(&path) {
+            out!("WARNING: {msg}");
+        }
+    }
+    if present()
+        && let Err(e) = intermediate()
+    {
+        out!("WARNING: {e}");
+    }
     if !present() {
-        println!("no services intermediate in {DIR}; the web UI uses its self-signed certificate");
+        out!("no services intermediate in {DIR}; the web UI uses its self-signed certificate");
     } else if r.cfg.web.certificate == WebCertificate::SelfSigned {
-        println!("web UI: its self-signed certificate ([web] certificate = \"self-signed\"), not issued here");
+        out!("web UI: its self-signed certificate ([web] certificate = \"self-signed\"), not issued here");
     }
     for w in wants(r) {
         let meta: Option<Meta> = fs::read_to_string(meta_path(&w)).ok().and_then(|t| serde_json::from_str(&t).ok());
         match meta {
             Some(m) => {
-                println!("{:<34} {:>4} days left  {}", w.name, (m.not_after - now() as i64) / 86400, m.names.join(" "))
+                out!("{:<34} {:>4} days left  {}", w.name, (m.not_after - now() as i64) / 86400, m.names.join(" "))
             }
-            None => println!("{:<34} not issued", w.name),
+            None => out!("{:<34} not issued", w.name),
         }
     }
 }

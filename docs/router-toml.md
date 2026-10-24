@@ -86,11 +86,12 @@ dhcp = { range = ["192.168.4.10", "192.168.5.250"] }
 | `address` | router address and prefix |
 | `macs` | MACs and MAC prefixes (`bc:24:11`) whose devices get this tier's addresses; on the house ports, untagged tiers only |
 | `wired` | every other device on a cable gets this tier (one tier) |
-| `vlan` | the tier travels tagged on every house port (veb(4) is VLAN-aware since 7.9): for Wi-Fi tiers; VLAN 1 is the bridge's own |
+| `vlan` | the tier travels tagged on the house ports (veb(4) is VLAN-aware since 7.9): for Wi-Fi tiers; VLAN 1 is the bridge's own |
+| `ports` | with `vlan`: the house ports that carry it (default: every one). Any device on a port that carries a VLAN can join it by tagging its frames, so list the access points' ports |
 | `kind` | `open` (the default: everything allowed, the router managed only where a rule allows it) or the older fixed policies `mgmt`, `lan`, `servers`, `guest` |
 | `dhcp` | `{ range = ["first", "last"], lease_time = 7200, max_lease_time = 86400 }`, or `ranges = [[…], […]]` |
 | `interface`, `bridge` | instead of the house ports: a port of its own, or a bridge of roles (older layout; `[[networks]]` in older files still reads) |
-| `ipv6`, `ipv6_slot` | as before; tiers sharing the house ports untagged share one /64 (the first of them carries it) |
+| `ipv6`, `ipv6_slot` | as before; tiers sharing the house ports untagged share one /64 (the first of them carries its slot). pf can't tell them apart there: the /64 gets the policy of the `wired` tier (else the first), and rules naming the other tiers match their IPv4 range only |
 | `description` | |
 
 The untagged tiers share one interface: the router has an address in each,
@@ -101,6 +102,27 @@ listed devices only: a device that takes one of its addresses itself (not by
 DHCP, not reserved for it) is cut off from the router by `octopus guard`
 (a bridge rule on the router's port; the firewall page lists it with a
 release button).
+
+**What the tiers are not.** They are a policy for traffic that goes
+through the router, not a wall on the wire:
+
+* pf only sees routed traffic. Devices on the house ports share one layer 2
+  network: a device in one untagged tier can give itself an address in
+  another and talk to its devices directly, so `[[rules]]` between untagged
+  tiers hold only for what the router forwards (`check` warns about them).
+* A device can tag its frames into any VLAN tier its port carries (all
+  ports unless the tier has `ports`), get a lease there and that tier's
+  policy. Make VLAN tiers no more trusted than the wired tier, or limit
+  them to the access points' ports.
+* MAC addresses are chosen by the device: `macs` (Kea places by the MAC in
+  the DHCP request) and the guard (it reads the ARP table) keep honest
+  devices apart, not a determined one. Because anyone can forge an ARP
+  entry with someone else's MAC, the guard never blocks a MAC that holds a
+  lease from Kea or is listed for a tier on that port; its blocks end a
+  day after the device last did it, and a port takes at most 64.
+* The bridge drops ARP from the house ports that claims one of the router's
+  addresses. Rogue DHCP servers and router advertisements on the wire are
+  not filtered.
 
 Guests are a tier the rules keep from inside. The wifi page writes these
 when it makes a guest tier; exceptions go above the block:
@@ -178,8 +200,14 @@ pf sees it before a forward translates it). `action` = `pass` / `block` /
 `reject`; `from`, `to` = `any`, `self`, `internal` (every internal network),
 `internet` (everything outside them), a network, host or table name (`net:`,
 `host:`, `table:` to disambiguate), an address or prefix; `proto`; `port`;
-`log`; `description`. The management guard (INV-1) and the DoT block (INV-4)
-come before them.
+`log`; `description`. Order on each interface: every tier's management
+guard (INV-1, fixed kinds only) and DoT/DoH blocks (INV-4), then the rules in
+file order, then reflected forwards, then each tier's kind policy. Open
+tiers' guard comes after the rules: only a rule lets them manage the router.
+A rule for one tier on the shared house ports takes only the part of its
+`from` inside that tier's range (a table can't be narrowed: use `all`).
+With IPv6 on, `internal` also covers every tier's delegated prefix and
+`internet` excludes them.
 
 The web UI's firewall page writes these for you: a rule there is source,
 destination and allow / deny / nat. Allow and deny become a `[[rules]]` entry
@@ -257,7 +285,7 @@ clients = ["pc", "192.168.1.11"]
 ## [ntp], [ssh], [logging], [web]
 
 * `[ntp]`: `servers = []`, `constraints = ["9.9.9.9", "www.google.com"]`, `serve = true`.
-* `[ssh]`: `port = 22`, `password_auth = false`, `root_login = "prohibit-password"`.
+* `[ssh]`: `port = 22`, `password_auth = false`, `root_login = "prohibit-password"` (or `yes`, `no`, `forced-commands-only`).
   sshd listens only on mgmt addresses (and the WireGuard address when a peer is mgmt).
 * `[logging]`: `remote = ["tls://host:514" | "tcp://…" | "udp://…"]`; for TLS `tls_ca` (the server's CA file) and, when it requires a client certificate, `tls_cert` + `tls_key` (`octopus pki csr` makes the key and request); `pf = true` sends pf's log to syslog as program `filterlog`; `pflow = "ip:port"` exports IPFIX, and `"127.0.0.1:2055"` runs octopus-collector on the router (flows labelled with names in `/var/log/octopus-flows`).
 * `[web]`: `enabled = true`, `port = 8443`, `certificate = "services"`: a leaf from
@@ -269,7 +297,7 @@ clients = ["pc", "192.168.1.11"]
 
 | key | default | |
 |---|---|---|
-| `mode` | `off` | `off`: IPv6 blocked completely. `pd`: a prefix from the ISP on the WAN (dhcp6leased), one /64 per network, router advertisements (rad), IPv6 policy mirroring IPv4 |
+| `mode` | `off` | `off`: IPv6 blocked completely. `pd`: a prefix from the ISP on the WAN (dhcp6leased), one /64 per network, router advertisements (rad). Rules apply to IPv6 too, with one exception: on the shared house ports the /64 counts as the `wired` tier (see [[tiers]]) |
 | `request` | 60 | prefix length asked for; 2^(64 − request) network slots |
 | `ula` | derived from the hostname | a unique local /48 (`fdxx::/48`): every network also gets a stable `ula:slot::/64` with the router at `::1`, used for DNS and NTP |
 | `advertise_dns` | false | RDNSS in router advertisements. Off: clients keep asking over IPv4, where views can tell them apart |
@@ -351,7 +379,7 @@ nothing else does). Decisions: `/var/log/octopus-proxy`.
 [proxy]
 [[proxy.allow]]
 network = "servers"
-hosts = ["deb.debian.org", "*.s3.eu-central-1.amazonaws.com"]   # *.x = below x, not x
+hosts = ["deb.debian.org", "my-backups.s3.eu-central-1.amazonaws.com"]   # *.x = below x, not x
 ```
 
 Clients that pin certificates or need mutual TLS go through `[[links]]` instead.
@@ -382,7 +410,7 @@ fcap = "proto tcp and dst port 22 and tflags S/SA"
 | `network` | — | a network, or `wan` |
 | `fcap` | — | `[src|dst] host A / net P / port N[-M]`, `proto tcp|udp|icmp|icmp6|N`, `tflags S/SA`, `len|ttl|icmp_type OP N`, `frag`, with `and`, `or`, `not`, parentheses. Flow-level terms (bps, pps) are refused |
 | `regex` | — | PCRE2 on the payload (TCP/UDP): lookaround and backreferences work; a match that takes too much work (`(a+)+$`) fails instead of stalling |
-| `action` | `log` | `log`, or `block`: the source goes into pf's `<lab_block>` through the pf helper |
+| `action` | `log` | `log`, or `block`: the source goes into pf's `<lab_block>` through the pf helper. Only sources that can be there (the network's own range; on `wan`, anything outside ours), and never the router, a tier that can manage it, or the upstreams: the capture sees packets before pf's antispoofing, and a forged one must not lock anyone out |
 | `block_for` | 3600 | seconds in `lab_block` |
 | `pcap` | true | matching packets kept in `/var/octopus/pcap/<name>-N.pcap` (4 × 16 MB ring) |
 
@@ -434,7 +462,7 @@ access points are elsewhere.
 | `password` | — | `secret:wifi_NAME`; the wifi page sets it (write-only), or `octopus secret set wifi_NAME < file` |
 | `bands` | `["2g", "5g"]` | |
 | `hidden` | false | |
-| `isolate` | guest tiers | clients can't reach each other (a guest tier: the `guest` kind, or a rule blocking it from `internal`) |
+| `isolate` | guest tiers | clients of one access point can't reach each other, on either band (a guest tier: the `guest` kind, or a rule blocking it from `internal`). Clients of two access points still meet through the wire |
 | `aps` | all | only on these access points |
 | `description` | | |
 

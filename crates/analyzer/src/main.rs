@@ -25,11 +25,14 @@ use std::os::unix::net::UnixStream;
 #[cfg(target_os = "openbsd")]
 use std::time::{Duration, Instant};
 
+use ipnet::IpNet;
 use serde::Deserialize;
 
 #[cfg(target_os = "openbsd")]
 mod bpf;
+mod bpfbuf;
 mod oneshot;
+mod pppoe;
 
 const LOST: &str = "pfhelper connection lost";
 const RING_FILES: usize = 4;
@@ -42,6 +45,9 @@ struct Config {
     user: String,
     pcap_dir: String,
     pfhelper: Option<String>,
+    /// Never blocked: the router, the networks that manage it, its upstreams.
+    #[serde(default)]
+    protected: Vec<IpNet>,
     rules: Vec<RuleConf>,
 }
 
@@ -58,6 +64,31 @@ struct RuleConf {
     action: String,
     block_for: u64,
     pcap: bool,
+    /// A rule on a network blocks only sources inside it (anything else
+    /// there is forged: the capture sees packets before pf's antispoofing).
+    #[serde(default)]
+    inside: Vec<IpNet>,
+    /// A rule on the WAN blocks only sources outside these (ours).
+    #[serde(default)]
+    outside: Vec<IpNet>,
+}
+
+impl RuleConf {
+    /// May `src` go into lab_block for this rule?
+    fn blockable(&self, src: IpAddr, protected: &[IpNet]) -> bool {
+        let special = match src {
+            IpAddr::V4(a) => {
+                a.is_unspecified() || a.is_loopback() || a.is_link_local() || a.is_multicast() || a.is_broadcast()
+            }
+            IpAddr::V6(a) => {
+                a.is_unspecified() || a.is_loopback() || a.is_multicast() || (a.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        !special
+            && !protected.iter().any(|p| p.contains(&src))
+            && (self.inside.is_empty() || self.inside.iter().any(|p| p.contains(&src)))
+            && !self.outside.iter().any(|p| p.contains(&src))
+    }
 }
 
 struct Rule {
@@ -130,6 +161,11 @@ fn payload_regex(pattern: &str) -> Result<pcre2::bytes::Regex, String> {
     if pattern.len() > 1000 {
         return Err("regex longer than 1000 characters".into());
     }
+    // a leading (*LIMIT_MATCH=...) or other start-of-pattern item would
+    // replace the bound below
+    if pattern.starts_with("(*") {
+        return Err("regex may not start with (* (start-of-pattern items are set here)".into());
+    }
     pcre2::bytes::RegexBuilder::new()
         .build(&format!("(*LIMIT_MATCH=200000)(*LIMIT_DEPTH=2000){pattern}"))
         .map_err(|e| e.to_string())
@@ -148,7 +184,11 @@ struct Pkt {
 fn dissect(dlt: i32, frame: &[u8]) -> Pkt {
     use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
     let sliced = match dlt {
-        1 => SlicedPacket::from_ethernet(frame),
+        // the WAN NIC and its VLAN carry IP in PPPoE sessions
+        1 => match pppoe::ip_offset(frame) {
+            Some(at) => SlicedPacket::from_ip(&frame[at..]),
+            None => SlicedPacket::from_ethernet(frame),
+        },
         0 | 12 => frame.get(4..).map_or(SlicedPacket::from_ip(&[]), SlicedPacket::from_ip),
         51 => frame.get(8..).map_or(SlicedPacket::from_ip(&[]), SlicedPacket::from_ip),
         _ => SlicedPacket::from_ip(frame),
@@ -199,33 +239,97 @@ struct Helper {
     conn: Option<(BufReader<UnixStream>, UnixStream)>,
 }
 
+/// A failed request: refused by the helper (nothing happened), or lost on
+/// the way (it may still have happened).
+enum Failed {
+    Refused(String),
+    Lost(String),
+}
+
 impl Helper {
     /// The helper drops idle connections: on a lost one, reconnect and retry once.
-    fn request(&mut self, op: &str, addr: IpAddr) -> Result<(), String> {
-        match self.once(op, addr) {
-            Err(e) if e == LOST => self.once(op, addr),
+    fn request(&mut self, op: &str, addrs: &[String]) -> Result<(), Failed> {
+        match self.once(op, addrs) {
+            Err(Failed::Lost(_)) => self.once(op, addrs),
             r => r,
         }
     }
 
-    fn once(&mut self, op: &str, addr: IpAddr) -> Result<(), String> {
-        let path = self.path.clone().ok_or("no pfhelper configured")?;
+    fn once(&mut self, op: &str, addrs: &[String]) -> Result<(), Failed> {
+        let path = self.path.clone().ok_or(Failed::Refused("no pfhelper configured".into()))?;
         if self.conn.is_none() {
-            let s = UnixStream::connect(&path).map_err(|e| format!("{path}: {e}"))?;
-            s.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| e.to_string())?;
-            self.conn = Some((BufReader::new(s.try_clone().map_err(|e| e.to_string())?), s));
+            let s = UnixStream::connect(&path).map_err(|e| Failed::Lost(format!("{path}: {e}")))?;
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+            let r = s.try_clone().map_err(|e| Failed::Lost(e.to_string()))?;
+            self.conn = Some((BufReader::new(r), s));
         }
         let (r, w) = self.conn.as_mut().unwrap();
-        let line =
-            serde_json::json!({"table": "lab_block", "op": op, "addresses": [addr.to_string()]}).to_string() + "\n";
+        let line = serde_json::json!({"table": "lab_block", "op": op, "addresses": addrs}).to_string() + "\n";
         let mut reply = String::new();
         let io = w.write_all(line.as_bytes()).and_then(|_| r.read_line(&mut reply));
         if io.is_err() || reply.is_empty() {
             self.conn = None;
-            return Err(LOST.into());
+            return Err(Failed::Lost(LOST.into()));
         }
-        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
-        if v["ok"].as_bool() == Some(true) { Ok(()) } else { Err(v["error"].as_str().unwrap_or("refused").to_string()) }
+        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| Failed::Lost(e.to_string()))?;
+        if v["ok"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(Failed::Refused(v["error"].as_str().unwrap_or("refused").to_string()))
+        }
+    }
+}
+
+/// lab_block on a thread of its own, so a slow or busy pf helper never
+/// stalls the capture: (address, seconds) in, adds and timed deletes out.
+/// A block whose add got lost on the way is kept too, so its delete still
+/// comes; a delete that fails is tried again.
+#[cfg(target_os = "openbsd")]
+fn blocker(path: String, jobs: std::sync::mpsc::Receiver<(IpAddr, u64)>) {
+    let mut helper = Helper { path: Some(path), conn: None };
+    // a new analyzer starts clean: the last one's blocks would never end
+    if let Err(Failed::Refused(e) | Failed::Lost(e)) = helper.request("replace", &[]) {
+        syslog(libc::LOG_DAEMON | libc::LOG_WARNING, &format!("pfhelper: clearing lab_block: {e}"));
+    }
+    let mut blocked: HashMap<IpAddr, Instant> = HashMap::new();
+    let mut last_expiry = Instant::now();
+    loop {
+        match jobs.recv_timeout(Duration::from_secs(10)) {
+            Ok((a, secs)) if !blocked.contains_key(&a) => {
+                let until = Instant::now() + Duration::from_secs(secs);
+                match helper.request("add", &[a.to_string()]) {
+                    Ok(()) => {
+                        blocked.insert(a, until);
+                    }
+                    Err(Failed::Refused(e)) => {
+                        syslog(libc::LOG_DAEMON | libc::LOG_WARNING, &format!("pfhelper refused {a}: {e}"));
+                    }
+                    Err(Failed::Lost(e)) => {
+                        syslog(libc::LOG_DAEMON | libc::LOG_WARNING, &format!("pfhelper: {e}"));
+                        blocked.insert(a, until);
+                    }
+                }
+            }
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if last_expiry.elapsed() < Duration::from_secs(30) {
+            continue;
+        }
+        last_expiry = Instant::now();
+        let now = Instant::now();
+        let due: Vec<IpAddr> = blocked.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
+        for a in due {
+            let r = helper.request("delete", &[a.to_string()]);
+            if !matches!(r, Err(Failed::Lost(_))) {
+                blocked.remove(&a);
+            }
+            syslog(
+                libc::LOG_LOCAL1 | libc::LOG_INFO,
+                &serde_json::json!({"unblock": a.to_string(), "ok": r.is_ok()}).to_string(),
+            );
+        }
     }
 }
 
@@ -337,16 +441,31 @@ fn run_capture(_: Config, _: Vec<(RuleConf, Option<pcre2::bytes::Regex>)>) -> Re
 fn run_capture(cfg: Config, conf_rules: Vec<(RuleConf, Option<pcre2::bytes::Regex>)>) -> Result<(), String> {
     let mut rules = vec![];
     for (c, re) in conf_rules {
-        let (fd, dlt) = bpf::open(&c.interface, &c.filter).map_err(|e| format!("rule {}: {e}", c.name))?;
+        // one rule that can't open (an interface gone, a filter bpf refuses)
+        // doesn't take the others down
+        let (fd, dlt) = match bpf::open(&c.interface, &c.filter, true) {
+            Ok(x) => x,
+            Err(e) => {
+                syslog(libc::LOG_DAEMON | libc::LOG_ERR, &format!("rule {} not running: {e}", c.name));
+                continue;
+            }
+        };
         let ring =
             c.pcap.then(|| Ring { dir: cfg.pcap_dir.clone(), name: c.name.clone(), idx: 0, file: None, size: 0, dlt });
         rules.push(Rule { conf: c, re, dlt, fd, ring, matches: 0, logged_this_sec: (0, 0) });
     }
+    if rules.is_empty() {
+        return Err("no rule could start".into());
+    }
     if rules.iter().any(|r| r.conf.action == "block") && cfg.pfhelper.is_none() {
         return Err("block rules need pfhelper".into());
     }
-    let mut helper = Helper { path: cfg.pfhelper.clone(), conn: None };
     drop_privileges(&cfg.user, &cfg.pcap_dir, cfg.pfhelper.as_deref())?;
+    let blocks = cfg.pfhelper.clone().map(|path| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(IpAddr, u64)>(1024);
+        std::thread::spawn(move || blocker(path, rx));
+        tx
+    });
     syslog(
         libc::LOG_DAEMON | libc::LOG_NOTICE,
         &format!(
@@ -356,25 +475,16 @@ fn run_capture(cfg: Config, conf_rules: Vec<(RuleConf, Option<pcre2::bytes::Rege
         ),
     );
 
-    let mut blocked: HashMap<IpAddr, Instant> = HashMap::new();
+    // sent to the blocker until they expire, so one source is asked for once
+    let mut asked: HashMap<IpAddr, Instant> = HashMap::new();
     let mut buf = vec![0u8; bpf::BUFLEN as usize];
-    let mut last_expiry = Instant::now();
     loop {
         let mut pfds: Vec<libc::pollfd> =
             rules.iter().map(|r| libc::pollfd { fd: r.fd, events: libc::POLLIN, revents: 0 }).collect();
         let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, 5000) };
-        if last_expiry.elapsed() > Duration::from_secs(30) {
-            last_expiry = Instant::now();
+        if asked.len() > 4096 {
             let now = Instant::now();
-            let gone: Vec<IpAddr> = blocked.iter().filter(|(_, t)| **t <= now).map(|(a, _)| *a).collect();
-            for a in gone {
-                blocked.remove(&a);
-                let r = helper.request("delete", a);
-                syslog(
-                    libc::LOG_LOCAL1 | libc::LOG_INFO,
-                    &serde_json::json!({"unblock": a.to_string(), "ok": r.is_ok()}).to_string(),
-                );
-            }
+            asked.retain(|_, t| *t > now);
         }
         if n <= 0 {
             continue;
@@ -404,18 +514,16 @@ fn run_capture(cfg: Config, conf_rules: Vec<(RuleConf, Option<pcre2::bytes::Rege
                 }
                 let mut action = "log";
                 if rule.conf.action == "block"
-                    && let Some(src) = p.src
-                    && !blocked.contains_key(&src)
+                    && let (Some(src), Some(tx)) = (p.src, &blocks)
+                    && asked.get(&src).is_none_or(|t| *t <= Instant::now())
                 {
-                    action = match helper.request("add", src) {
-                        Ok(()) => {
-                            blocked.insert(src, Instant::now() + Duration::from_secs(rule.conf.block_for));
-                            "block"
-                        }
-                        Err(e) => {
-                            syslog(libc::LOG_DAEMON | libc::LOG_WARNING, &format!("pfhelper: {e}"));
-                            "block-failed"
-                        }
+                    action = if !rule.conf.blockable(src, &cfg.protected) {
+                        "not-blocked"
+                    } else if tx.try_send((src, rule.conf.block_for)).is_ok() {
+                        asked.insert(src, Instant::now() + Duration::from_secs(rule.conf.block_for));
+                        "block"
+                    } else {
+                        "block-busy"
                     };
                 }
                 // at most LOG_PER_SEC lines per rule and second; blocks always
@@ -452,6 +560,26 @@ mod tests {
         assert_eq!((p.proto, p.sport, p.dport), ("tcp", 40000, 80));
         assert_eq!(p.payload, payload);
         // junk never panics
+        for cut in 0..frame.len() {
+            let _ = super::dissect(1, &frame[..cut]);
+        }
+    }
+
+    #[test]
+    fn dissects_pppoe_on_ethernet() {
+        use etherparse::PacketBuilder;
+        let b = PacketBuilder::ipv4([198, 51, 100, 182], [1, 1, 1, 1], 64).udp(5353, 53);
+        let mut ip = vec![];
+        b.write(&mut ip, b"q").unwrap();
+        // vlan 848, PPPoE session 1, PPP IPv4
+        let mut frame = [[2u8; 12].as_slice(), &[0x81, 0x00, 0x03, 0x50, 0x88, 0x64, 0x11, 0, 0, 1]].concat();
+        frame.extend((ip.len() as u16 + 2).to_be_bytes());
+        frame.extend([0, 0x21]);
+        frame.extend(&ip);
+        let p = super::dissect(1, &frame);
+        assert_eq!(p.src, Some("198.51.100.182".parse().unwrap()));
+        assert_eq!((p.proto, p.sport, p.dport), ("udp", 5353, 53));
+        assert_eq!(p.payload, b"q");
         for cut in 0..frame.len() {
             let _ = super::dissect(1, &frame[..cut]);
         }

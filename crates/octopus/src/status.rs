@@ -133,9 +133,41 @@ fn num(s: &str) -> u64 {
     s.parse().unwrap_or(0)
 }
 
-/// Active leases from dhcpd.leases (the last entry for an address wins).
+/// The MACs that hold an active lease from Kea, whatever tier.
+pub fn leased_macs() -> std::collections::BTreeSet<String> {
+    leases().iter().filter_map(|l| l["mac"].as_str().map(str::to_ascii_lowercase)).collect()
+}
+
+/// Active leases: Kea's lease files in the order it reads them at start
+/// (the cleanup run every hour moves the older entries to .2 and .1), the
+/// last entry for an address winning; at most 4 MB of each.
 fn leases() -> Vec<Value> {
-    leases_from(&fs::read_to_string(KEA_LEASES).unwrap_or_default(), now() as i64)
+    use std::io::Read;
+    let parts: Vec<String> = [format!("{KEA_LEASES}.2"), format!("{KEA_LEASES}.1"), KEA_LEASES.to_string()]
+        .iter()
+        .map(|f| {
+            let mut part = String::new();
+            if let Ok(h) = fs::File::open(f) {
+                let _ = h.take(4 << 20).read_to_string(&mut part);
+            }
+            part
+        })
+        .collect();
+    leases_from(&joined(&parts), now() as i64)
+}
+
+/// Lease files one after the other, under the first header found.
+fn joined(parts: &[String]) -> String {
+    let mut text = String::new();
+    for part in parts.iter().filter(|p| !p.is_empty()) {
+        // every file has the header line: keep the first one only
+        let body = if text.is_empty() { part.as_str() } else { part.split_once('\n').map_or("", |x| x.1) };
+        text.push_str(body);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 const KEA_LEASES: &str = "/var/lib/kea/kea-leases4.csv";
@@ -154,7 +186,8 @@ fn leases_from(text: &str, now: i64) -> Vec<Value> {
         let Some(ip) = f.get(ia) else { continue };
         let expire: i64 = f.get(ie).and_then(|x| x.parse().ok()).unwrap_or(0);
         let state = is.and_then(|i| f.get(i)).copied().unwrap_or("0");
-        if expire <= now || state == "2" {
+        // 2: expired and reclaimed, 3: released
+        if expire <= now || state == "2" || state == "3" {
             by_ip.remove(*ip);
             continue;
         }
@@ -340,14 +373,25 @@ fn dns_log() -> Value {
     json!({"queries": total, "errors": errors, "recent": recent, "top_names": top(names), "top_clients": top(clients), "classes": top(classes), "views": top(views)})
 }
 
+/// The last octopus lines of /var/log/daemon (its last 256 KB: clients can
+/// make the log grow, and this runs on every poll of the web UI).
 fn octopus_log() -> Vec<String> {
-    let text = fs::read_to_string("/var/log/daemon").unwrap_or_default();
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open("/var/log/daemon") else { return vec![] };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(256 << 10)));
+    let mut raw = vec![];
+    let _ = f.take(256 << 10).read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
     let lines: Vec<String> = text.lines().filter(|l| l.contains(" octopus")).map(str::to_string).collect();
     lines[lines.len().saturating_sub(40)..].to_vec()
 }
 
 pub fn collect() -> Value {
-    let st = load_state();
+    let (st, state_error) = match load_state() {
+        Ok(st) => (st, None),
+        Err(e) => (Default::default(), Some(e)),
+    };
     let gens: Vec<Value> = gens::list()
         .iter()
         .rev()
@@ -366,7 +410,8 @@ pub fn collect() -> Value {
         "state": {
             "current": st.current,
             "confirmed": st.confirmed,
-            "pending": st.pending.as_ref().map(|p| json!({"gen": p.generation, "previous": p.previous, "deadline": p.deadline, "remaining": p.deadline.saturating_sub(now())})),
+            "pending": st.pending.as_ref().map(|p| json!({"gen": p.generation, "previous": p.previous, "deadline": p.deadline, "remaining": p.deadline.saturating_sub(now()), "applying": p.applying, "reverting": p.reverting})),
+            "error": state_error,
         },
         "generations": gens,
         "interfaces": ifaces(),
@@ -381,7 +426,8 @@ pub fn collect() -> Value {
             "octopus_proxy",
             "octopus_collector",
             "octopus_analyzer",
-            "dhcpd",
+            "octopus_kea",
+            "octopus_guard",
             "dhcp6leased",
             "rad",
             "nginx",
@@ -425,5 +471,36 @@ mod lease_tests {
         assert_eq!(l.len(), 1, "{l:?}");
         assert_eq!(l[0]["hostname"], "desk");
         assert_eq!(super::time_utc(1790859600), "2026/10/01 13:00:00");
+    }
+
+    #[test]
+    fn leases_kea_moved_aside() {
+        // as on a router after Kea's hourly cleanup: most leases are in .2, the
+        // current file has only what changed since
+        let h = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id\n";
+        let two = format!(
+            "{h}192.168.4.18,02:00:5e:10:00:21,,7200,5000,1,0,0,phone-a,0,,0\n192.168.4.19,02:00:5e:10:00:22,,7200,5000,1,0,0,,0,,0\n"
+        );
+        let current = format!(
+            "{h}192.168.4.19,02:00:5e:10:00:22,,7200,4000,1,0,0,,2,,0\n192.168.2.53,02:00:5e:10:00:23,,7200,5000,1,0,0,,3,,0\n"
+        );
+        let l = super::leases_from(&super::joined(&[two, String::new(), current]), 1000);
+        let ips: Vec<&str> = l.iter().map(|x| x["ip"].as_str().unwrap()).collect();
+        assert_eq!(ips, ["192.168.4.18"], "{l:?}");
+    }
+}
+
+#[cfg(test)]
+mod real_files {
+    /// KEA_DIR=dir cargo test real_kea -- --nocapture: the leases those files hold now
+    #[test]
+    fn real_kea() {
+        let Ok(d) = std::env::var("KEA_DIR") else { return };
+        let read = |n: &str| std::fs::read_to_string(format!("{d}/{n}")).unwrap_or_default();
+        let parts = [read("kea-leases4.csv.2"), read("kea-leases4.csv.1"), read("kea-leases4.csv")];
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let all = super::leases_from(&super::joined(&parts), now);
+        let cur = super::leases_from(&parts[2], now);
+        println!("active leases: {} (current file alone: {})", all.len(), cur.len());
     }
 }

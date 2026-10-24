@@ -6,7 +6,7 @@ with these deviations and decisions; everything else stands as written.
 | Topic | Design | Octopus | Why |
 |---|---|---|---|
 | Name | `rctl` placeholder | project **Octopus**: `octopus` CLI, `octopus-dns`, `octopus-pfhelper`, `octopus-web`; rc names `octopus_*`; `/etc/octopus`, `/var/octopus` | owner's name |
-| Web UI | "no PHP or web UI stack" | a small Rust UI (`octopus-web`, x11 look) | owner asked for a front-end in the x11 design. It runs as `_octoweb`, pledged/unveiled, HTTPS on mgmt addresses only (INV-1), bcrypt logins, CSRF/Origin checks, strict CSP. It never holds root or secrets: status/diff/apply/confirm/rollback go through five exact `doas` rules to the `octopus` CLI, which rebuilds the staged router.toml from scratch |
+| Web UI | "no PHP or web UI stack" | a small Rust UI (`octopus-web`, x11 look) | owner asked for a front-end in the x11 design. It runs as `_octoweb`, pledged/unveiled, HTTPS on mgmt addresses only (INV-1), bcrypt logins, a custom request header against CSRF (no Origin checks: management is internal), strict CSP, read-only users. It never holds root or secrets: ten exact `doas` rules (deploy/doas.conf) reach the `octopus` CLI (status, diff/apply of the staged router.toml, which it rebuilds and checks from scratch, confirm, rollback, AP pushes, a Wi-Fi passphrase, a guard release) and the analyzer's one-shot capture. Applying is root-equivalent by design: anyone who may log in (and isn't read-only) is an administrator |
 | Real network | VLAN trunk, mgmt/lan/servers | the imported router has three flat ports (192.168.1/24 mgmt, 192.168.2/24, 192.168.8/21) | faithful import; VLANs and `servers` remain available (`examples/vlans.toml`) |
 | Policy order | per network | per network: reflection → mgmt guard (INV-1) → DoT block (INV-4) → explicit `[[rules]]` (first match) → kind policy; everything after `block log all` is `quick` | keeps imported pfSense rule order meaningful |
 | DoH canary, phase A | NXDOMAIN | NODATA from an empty zone (Firefox disables DoH on both); phase B answers NXDOMAIN | hickory's blocklist returns 0.0.0.0, which would not disable DoH |
@@ -193,7 +193,7 @@ domains = ["deb.debian.org", "download.docker.com", "objects.githubusercontent.c
 
 [[proxy.allow]]
 network = "servers"
-hosts = ["deb.debian.org", "security.debian.org", "*.s3.eu-central-1.amazonaws.com"]
+hosts = ["deb.debian.org", "security.debian.org", "my-backups.s3.eu-central-1.amazonaws.com"]
 
 [[links]]                               # direct egress exceptions for servers
 network = "servers"
@@ -245,7 +245,7 @@ Check the exact flags against the OpenBSD 7.9 man pages.
 
 ### 7.5 `pf-helper`
 
-`pf-helper` is a tiny root daemon that listens on a Unix socket with restrictive permissions. It accepts only the operations `{table, add|delete|replace, addresses[]}`. `table` must be on the allowlist in its own config (`cls_realtime`, `cls_streaming`, `cls_bulk`, `lab_block`). It validates every address as a single IPv4/IPv6 host or prefix, runs `pfctl -t <table> -T <op>` (stdin for batches), and logs every action. It uses `pledge`/`unveil` to restrict itself to executing `pfctl`. It has no other capabilities.
+`pf-helper` is a tiny root daemon that listens on a Unix socket with restrictive permissions. It accepts only the operations `{table, add|delete|replace, addresses[]}`. `table` must be on the allowlist in its own config (`cls_realtime`, `cls_streaming`, `cls_bulk`, `lab_block`). It validates every address as a single IPv4/IPv6 host or prefix, runs `pfctl -t <table> -T <op>` (stdin for batches), and logs every action. (Octopus: each client uid writes its own tables only, `_octodns` the `cls_*` ones and `_octoflow` `lab_block`; clients are served side by side with timeouts.) It uses `pledge`/`unveil` to restrict itself to executing `pfctl`. It has no other capabilities.
 
 ## 8. Build, install and deploy
 
@@ -257,7 +257,8 @@ Suggested workspace layout:
 |---|---|---|
 | `crates/config` | Schema, loading, secrets resolution, invariants | 1 |
 | `crates/render` | One module per target file type | 1 |
-| `crates/import-pfsense` | Redacted `config.xml` → `router.toml` (interfaces, VLANs, aliases → tables, static maps → reservations, rules, port forwards, WireGuard) | 1 |
+| Kea runs as root | (R6: network input parsed unprivileged) | kea-dhcp4 keeps root for its raw (BPF) sockets, no chroot or pledge | needed for the MAC classes the tiers rely on. A Kea bug would be root on the router from any tier: keep it current (`pkg_add -u kea` with every upgrade); `octopus supervise` starts it again if it dies |
+| `crates/import-pfsense` | `config.xml` (the unredacted one: the PPPoE password comes from it) → `router.toml` (interfaces, VLANs, aliases → tables, rules, port forwards; Octopus: static maps, WireGuard, IPsec, OpenVPN, outbound/1:1 NAT and static routes get a "not imported" report line instead) | 1 |
 | `crates/rctl` | CLI: build, validate, apply, confirm, rollback, diff | 1 |
 | `crates/pf-helper` | Privileged table updater | 3 |
 | `crates/dns` | `rctl-dns` daemon (Hickory-based) | 3 |
@@ -441,7 +442,7 @@ The later phase adds three pieces:
 
 - A Rust collector that joins flows with preceding DNS lookups, answering "which name was this connection for".
 - An analyzer that translates Arbor-style FCAP expressions into pcap filters, attaches them as BPF in the kernel and locks them (`BIOCLOCK`), drops privileges, runs regex on the matched payloads (`regex` or `pcre2` crate) and writes ring-buffered pcaps.
-- Optional block actions through `pf-helper`'s `lab_block` table in a dedicated anchor.
+- Optional block actions through `pf-helper`'s `lab_block` table. (Octopus: not an anchor but two global quick rules ahead of every pass, `block in` from it and `block out` to it for forwarded traffic; so lab_block only ever takes single addresses, never the router's, a network's that manages it, or an upstream's (`/etc/octopus/pfhelper.conf`), only from the analyzer, only sources that can be where the rule looks (its network's range, or outside ours on the WAN), and pf drops entries older than the longest `block_for` by itself.)
 
 ## 18. Updates and operations
 

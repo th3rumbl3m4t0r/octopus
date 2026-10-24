@@ -28,8 +28,16 @@ work=${AP_IMAGE_CACHE:-$HOME/.cache/octopus-ap-image}/$rel-$(echo "$target" | tr
 mkdir -p "$work" "$out"
 cd "$work"
 
-# the Image Builder, checked against OpenWrt's sha256sums
+# the Image Builder, checked against OpenWrt's sha256sums, which are checked
+# against OpenWrt's signature (gpg with their release key in the keyring;
+# AP_IMAGE_UNSIGNED=1 to go without, knowing the sums come from the same server)
 curl -fsS -o sha256sums "$base/sha256sums"
+if [ "${AP_IMAGE_UNSIGNED:-0}" != 1 ]; then
+	curl -fsS -o sha256sums.asc "$base/sha256sums.asc" ||
+		{ echo "no sha256sums.asc at $base (AP_IMAGE_UNSIGNED=1 to go on unverified)" >&2; exit 1; }
+	gpg --verify sha256sums.asc sha256sums 2>/dev/null ||
+		{ echo "sha256sums: bad or unknown signature; import OpenWrt's release key (openwrt.org/docs/guide-user/security/signatures)" >&2; exit 1; }
+fi
 ib=$(awk '/imagebuilder.*Linux-x86_64\.tar/ {sub(/^\*/, "", $2); print $2}' sha256sums)
 [ -n "$ib" ] || { echo "no Image Builder in $base" >&2; exit 1; }
 if ! grep " \*\?$ib\$" sha256sums | sed 's/ \*/  /' | sha256sum -c --status 2>/dev/null; then
@@ -38,7 +46,13 @@ if ! grep " \*\?$ib\$" sha256sums | sed 's/ \*/  /' | sha256sum -c --status 2>/d
 	grep " \*\?$ib\$" sha256sums | sed 's/ \*/  /' | sha256sum -c --quiet
 fi
 dir=${ib%.tar.*}
-[ -d "$dir" ] || tar -xf "$ib"
+# extracted again when the tarball changed (snapshots keep their name)
+sum=$(sha256sum "$ib" | cut -c1-64)
+if [ "$(cat "$dir/.octopus-sha256" 2>/dev/null)" != "$sum" ]; then
+	rm -rf "$dir"
+	tar -xf "$ib"
+	echo "$sum" > "$dir/.octopus-sha256"
+fi
 
 # what goes into the image on top of the stock one
 files=$work/files-$profile
@@ -57,6 +71,7 @@ delete network.wan
 delete network.wan6
 set dropbear.@dropbear[0].PasswordAuth='off'
 set dropbear.@dropbear[0].RootPasswordAuth='off'
+set dropbear.@dropbear[0].Interface='lan'
 commit
 UCI
 for s in dnsmasq odhcpd firewall; do [ -x /etc/init.d/$s ] && /etc/init.d/$s disable; done

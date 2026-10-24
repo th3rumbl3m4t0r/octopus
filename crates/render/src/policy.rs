@@ -12,7 +12,8 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
-    /// "in" (from the internet), "out" (inside to the internet), "internal"
+    /// "in" (from the internet), "rules" (the explicit [[rules]] from inside,
+    /// in file order: first match), "out" (inside to the internet), "internal"
     pub section: &'static str,
     pub source: String,
     pub destination: String,
@@ -155,9 +156,14 @@ pub fn rows(r: &Router) -> Vec<Row> {
     if c.wan.is_some() {
         for (k, rule) in c.rules.iter().enumerate().filter(|(_, x)| x.network == RULE_WAN) {
             let from = if rule.from == "any" { "internet" } else { rule.from.as_str() };
+            // pf sees the WAN address and port, before a forward translates them
+            let to = match r.endpoint(&rule.to) {
+                Ok(e) if r.is_internal(&e) => format!("the WAN address (not {} itself)", describe(r, &rule.to)),
+                _ => describe(r, &rule.to),
+            };
             v.push(
                 R::new("in", action(rule.action), from, &rule.to)
-                    .words(describe(r, from), describe(r, &rule.to))
+                    .words(describe(r, from), to)
                     .service(proto_port(rule.proto, rule.port.as_ref()))
                     .labels([format!("rule:{}", k + 1)])
                     .note(rule.description.clone().unwrap_or_default())
@@ -222,19 +228,35 @@ pub fn rows(r: &Router) -> Vec<Row> {
         );
     }
 
-    // ---- rules on every internal network
-    for (k, rule) in c.rules.iter().enumerate().filter(|(_, x)| x.network == RULE_ALL) {
-        v.push(explicit(r, k, rule, "internal", "internal ranges"));
+    // ---- the explicit rules from inside, in file order: pf takes them that
+    // way on every interface (after the guards and DoT/DoH blocks, before
+    // the tiers' own policy)
+    for (k, rule) in c.rules.iter().enumerate().filter(|(_, x)| x.network != RULE_WAN) {
+        let row = match r.net(&rule.network) {
+            Some((_, n)) => explicit(r, k, rule, &format!("net:{}", n.name), &net_label(n)),
+            None => explicit(r, k, rule, "internal", "internal ranges"),
+        };
+        v.push(row);
+    }
+    // reflected forwards: inside clients reach the host through the WAN
+    // address, after the explicit rules
+    if c.wan.is_some() {
+        for (k, f) in c.forwards.iter().enumerate().filter(|(_, f)| f.reflect) {
+            v.push(
+                R::new("internal", "nat", "internal", &host_token(r, f.to))
+                    .words("inside clients, through the WAN address", host_name(r, f.to))
+                    .service(proto_port(f.proto, Some(&f.port)))
+                    .labels([format!("fwd:{}:reflect", f.name)])
+                    .note(format!("{}: NAT reflection", f.name))
+                    .row(Some(("forwards", k))),
+            );
+        }
     }
 
     // ---- per network
     for n in &r.nets {
         let me = net_label(n);
         let tok = format!("net:{}", n.name);
-        // explicit rules first: they are first-match
-        for (k, rule) in c.rules.iter().enumerate().filter(|(_, x)| x.network == n.name) {
-            v.push(explicit(r, k, rule, &tok, &me));
-        }
         match n.kind {
             Kind::Mgmt => {
                 v.push(
@@ -403,10 +425,11 @@ pub fn rows(r: &Router) -> Vec<Row> {
     if let Some(w) = &c.wireguard {
         let peers =
             |k: Kind| w.peers.iter().filter(|p| p.policy == k).map(|p| p.name.clone()).collect::<Vec<_>>().join(", ");
+        let tunnel = w.address.trunc().to_string();
         let m = peers(Kind::Mgmt);
         if !m.is_empty() {
             v.push(
-                R::new("internal", "allow", "any", "any")
+                R::new("internal", "allow", &tunnel, "any")
                     .words(format!("WireGuard peers {m}"), "everything, the internet too")
                     .labels(["wg_mgmt:mgmt".to_string()])
                     .note("mapped to mgmt")
@@ -416,7 +439,7 @@ pub fn rows(r: &Router) -> Vec<Row> {
         let l = peers(Kind::Lan);
         if !l.is_empty() {
             v.push(
-                R::new("out", "allow", "any", "internet")
+                R::new("out", "allow", &tunnel, "internet")
                     .words(format!("WireGuard peers {l}"), "the internet")
                     .labels(["wg_lan:internet".to_string()])
                     .note("mapped to lan")
@@ -436,9 +459,7 @@ fn explicit(r: &Router, k: usize, rule: &Rule, tok: &str, me: &str) -> Row {
     } else {
         (rule.from.clone(), format!("{} in {}", describe(r, &rule.from), rule.network))
     };
-    let to = r.endpoint(&rule.to).unwrap_or(Endpoint::Any);
-    let section = if r.is_internal(&to) { "internal" } else { "out" };
-    R::new(section, action(rule.action), &src, &rule.to)
+    R::new("rules", action(rule.action), &src, &rule.to)
         .words(source, describe(r, &rule.to))
         .service(proto_port(rule.proto, rule.port.as_ref()))
         .labels([format!("rule:{}", k + 1)])

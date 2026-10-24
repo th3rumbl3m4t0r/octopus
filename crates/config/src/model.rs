@@ -22,6 +22,8 @@ pub struct Net {
     pub bridge: Option<String>,
     /// The bridged ports (physical names).
     pub members: Vec<String>,
+    /// A VLAN of a bridge: the members that carry it tagged.
+    pub carried: Vec<String>,
     /// Set when the interface carries several tiers (the house ports,
     /// untagged): this tier is told apart by its source addresses.
     pub src: Option<Ipv4Net>,
@@ -45,7 +47,9 @@ pub struct V6 {
 impl Net {
     /// Ports whose egress queue carries this network's traffic.
     pub fn ports(&self) -> Vec<&str> {
-        if !self.members.is_empty() {
+        if !self.carried.is_empty() {
+            self.carried.iter().map(String::as_str).collect()
+        } else if !self.members.is_empty() {
             self.members.iter().map(String::as_str).collect()
         } else {
             vec![self.parent.as_deref().unwrap_or(&self.ifname)]
@@ -148,6 +152,7 @@ impl Router {
         let v6_on = cfg.ipv6.mode == Ipv6Mode::Pd;
         let ula = ula_prefix(&cfg);
         for (idx, n) in cfg.networks.iter().enumerate() {
+            let mut carried = vec![];
             let (ifname, parent, bridge, members) = match (&n.interface, n.bridge.as_slice()) {
                 (Some(role), []) => {
                     let Some(p) = phys.get(role) else {
@@ -173,6 +178,9 @@ impl Router {
                     let veb = bridges.entry(key).or_insert_with(|| format!("veb{next}")).clone();
                     let v = vports;
                     vports += 1;
+                    if n.vlan.is_some() {
+                        carried = members.clone();
+                    }
                     (format!("vport{v}"), None, Some(veb), members)
                 }
                 (None, []) if cfg.lan.is_some() => {
@@ -188,6 +196,14 @@ impl Router {
                     key.sort();
                     let next = bridges.len();
                     let veb = bridges.entry(key).or_insert_with(|| format!("veb{next}")).clone();
+                    if n.vlan.is_some() {
+                        carried = lan
+                            .ports
+                            .iter()
+                            .filter(|role| n.ports.is_empty() || n.ports.contains(role))
+                            .filter_map(|role| phys.get(role).cloned())
+                            .collect();
+                    }
                     let vport = match (n.vlan, &lan_untagged) {
                         (None, Some(v)) => v.clone(),
                         _ => {
@@ -225,6 +241,7 @@ impl Router {
                 parent,
                 bridge,
                 members,
+                carried,
                 src: None,
                 v6,
                 vlan: n.vlan,
@@ -314,6 +331,55 @@ impl Router {
             })
     }
 
+    /// The tier whose policy the IPv6 of a shared interface gets: the one
+    /// /64 on it can't tell its tiers apart, so it goes with the tier every
+    /// unknown device lands in (`wired`), else the first. None when the
+    /// interface has no IPv6 or isn't shared.
+    pub fn v6_owner(&self, ifname: &str) -> Option<&Net> {
+        let here: Vec<&Net> = self.nets.iter().filter(|n| n.ifname == ifname).collect();
+        if here.len() < 2 || !here.iter().any(|n| n.v6.is_some()) {
+            return None;
+        }
+        let wired = |n: &&&Net| self.cfg.networks.iter().any(|x| x.name == n.name && x.wired);
+        here.iter().find(wired).or(here.first()).copied()
+    }
+
+    /// Can devices of this tier reach the router's ssh or web UI: a mgmt
+    /// tier, or a pass rule that lets them?
+    pub fn manages_router(&self, n: &Net) -> bool {
+        let c = &self.cfg;
+        let (ssh, web) = (c.ssh.port, c.web.enabled.then_some(c.web.port));
+        n.kind == Kind::Mgmt
+            || c.rules.iter().any(|rule| {
+                rule.action == Action::Pass
+                    && (rule.network == RULE_ALL || rule.network == n.name)
+                    && matches!(rule.proto, Proto::Any | Proto::Tcp | Proto::TcpUdp)
+                    && rule.port.as_ref().is_none_or(|ps| ps.contains(ssh) || web.is_some_and(|w| ps.contains(w)))
+                    && self.endpoint(&rule.from).is_ok_and(|f| self.endpoint_in_net(&f, n))
+                    && self.endpoint(&rule.to).is_ok_and(|t| self.covers_router(&t))
+            })
+    }
+
+    /// IPv4 prefixes that are inside: the tiers, the WireGuard tunnel and
+    /// the networks behind [[routes]].
+    pub fn internal_v4(&self) -> Vec<Ipv4Net> {
+        let mut v: Vec<Ipv4Net> = self.nets.iter().map(|n| n.prefix).collect();
+        if let Some(w) = &self.cfg.wireguard {
+            v.push(w.address.trunc());
+        }
+        v.extend(self.cfg.routes.iter().filter_map(|r| r.to.parse::<Ipv4Net>().ok()).map(|p| p.trunc()));
+        v
+    }
+
+    /// The tier an endpoint stands for: a tier, or an address inside one.
+    pub fn endpoint_tier(&self, e: &Endpoint) -> Option<&Net> {
+        match e {
+            Endpoint::Net(i) => Some(&self.nets[*i]),
+            Endpoint::Addr(IpNet::V4(a)) => self.nets.iter().find(|n| n.prefix.contains(a)),
+            _ => None,
+        }
+    }
+
     /// A host's tier: as named, else the one whose range holds its address.
     pub fn host_net(&self, h: &Host) -> Option<&Net> {
         match &h.network {
@@ -322,9 +388,15 @@ impl Router {
         }
     }
 
+    /// Where sshd and the web UI listen: mgmt tiers, open tiers a rule lets
+    /// manage the router, the tunnel when a mgmt peer exists.
     pub fn mgmt_addrs(&self) -> Vec<Ipv4Addr> {
-        let mut v: Vec<Ipv4Addr> =
-            self.nets.iter().filter(|n| matches!(n.kind, Kind::Mgmt | Kind::Open)).map(|n| n.addr).collect();
+        let mut v: Vec<Ipv4Addr> = self
+            .nets
+            .iter()
+            .filter(|n| n.kind == Kind::Mgmt || (n.kind == Kind::Open && self.manages_router(n)))
+            .map(|n| n.addr)
+            .collect();
         if let Some(wg) = &self.cfg.wireguard
             && wg.peers.iter().any(|p| p.policy == Kind::Mgmt)
         {
@@ -397,8 +469,9 @@ impl Router {
 
     /// Can `e` contain an address of an internal network?
     pub fn overlaps_internal(&self, e: &Endpoint) -> bool {
+        let inside = self.internal_v4();
         let hit = |a: &IpNet| match a {
-            IpNet::V4(a) => self.nets.iter().any(|n| n.prefix.contains(a) || a.contains(&n.prefix)),
+            IpNet::V4(a) => inside.iter().any(|n| n.contains(a) || a.contains(n)),
             IpNet::V6(_) => false,
         };
         match e {
@@ -413,8 +486,9 @@ impl Router {
 
     /// Is `e` entirely inside the internal networks (or the router)?
     pub fn is_internal(&self, e: &Endpoint) -> bool {
+        let prefixes = self.internal_v4();
         let inside = |a: &IpNet| match a {
-            IpNet::V4(a) => self.nets.iter().any(|n| n.prefix.contains(a)),
+            IpNet::V4(a) => prefixes.iter().any(|n| n.contains(a)),
             IpNet::V6(_) => false,
         };
         match e {

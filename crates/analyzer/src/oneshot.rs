@@ -2,8 +2,9 @@
 //!
 //! The request ({interface, fcap, pcre, seconds, max_packets}) is staged by
 //! _octoweb, so it is read without following links and validated like any
-//! other untrusted input. As root this only opens bpf with the translated
-//! filter and locks it; then it drops to _octoflow, pledges stdio and
+//! other untrusted input. As root this only reads the request, translates
+//! the filter, opens bpf with it and locks it; then it drops to _octoflow,
+//! pledges stdio, limits its CPU time, compiles the payload regex and
 //! captures until the time or packet limit. Output: JSON on stdout.
 
 use std::io::Read;
@@ -50,8 +51,8 @@ fn read_request(path: &str) -> Result<Request, String> {
     if r.seconds == 0 || r.seconds > MAX_SECONDS || r.max_packets == 0 || r.max_packets > MAX_PACKETS {
         return Err(format!("1-{MAX_SECONDS} seconds and 1-{MAX_PACKETS} packets"));
     }
-    if r.fcap.len() > 1000 {
-        return Err("fcap longer than 1000 characters".into());
+    if r.fcap.len() > 1000 || r.pcre.len() > 1000 {
+        return Err("fcap and pcre: at most 1000 characters".into());
     }
     Ok(r)
 }
@@ -94,12 +95,14 @@ pub fn run(path: &str) -> Result<(), String> {
 
     let r = read_request(path)?;
     let filter = filter(&r.fcap)?;
+    let (fd, dlt) = super::bpf::open(&r.interface, &filter, false)?;
+    // whatever the pattern costs, this process ends a little after its time
+    drop_to_user(r.seconds as u64 + 5)?;
+    // the regex library is C: it only sees the pattern without privileges
     let re = match r.pcre.as_str() {
         "" => None,
         p => Some(super::payload_regex(p).map_err(|e| format!("pcre: {e}"))?),
     };
-    let (fd, dlt) = super::bpf::open(&r.interface, &filter)?;
-    drop_to_user()?;
 
     let deadline = Instant::now() + Duration::from_secs(r.seconds as u64);
     let mut buf = vec![0u8; super::bpf::BUFLEN as usize];
@@ -119,6 +122,9 @@ pub fn run(path: &str) -> Result<(), String> {
             continue;
         }
         for (sec, usec, datalen, frame) in super::bpf::records(&buf[..len as usize]) {
+            if Instant::now() >= deadline {
+                break 'capture;
+            }
             seen += 1;
             let p = super::dissect(dlt, frame);
             let at = match &re {
@@ -158,12 +164,16 @@ pub fn run(path: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "openbsd")]
-fn drop_to_user() -> Result<(), String> {
+fn drop_to_user(cpu_secs: u64) -> Result<(), String> {
     let uid = super::ids(USER, "/etc/passwd", 2).ok_or_else(|| format!("no user {USER}"))?;
     let gid = super::ids(USER, "/etc/passwd", 3).ok_or_else(|| format!("no user {USER}"))?;
     unsafe {
         if libc::setgroups(1, &gid as *const u32 as *const _) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
             return Err(format!("cannot drop to {USER}"));
+        }
+        let cpu = libc::rlimit { rlim_cur: cpu_secs, rlim_max: cpu_secs };
+        if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+            return Err("setrlimit".into());
         }
         if libc::unveil(c"/".as_ptr(), c"".as_ptr()) != 0
             || libc::unveil(std::ptr::null(), std::ptr::null()) != 0

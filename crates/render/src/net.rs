@@ -64,7 +64,7 @@ pub(crate) fn render(r: &Router, secrets: &SecretSource, g: &mut Generation) -> 
             if let Some(vid) = n.vlan {
                 // a VLAN of the bridge: its vport in that VLAN, the ports carry it tagged
                 line(&mut files, b, &format!("untagged {} {vid}", n.ifname));
-                for m in &n.members {
+                for m in &n.carried {
                     line(&mut files, b, &format!("tagged {m} +{vid}"));
                 }
             }
@@ -76,6 +76,22 @@ pub(crate) fn render(r: &Router, secrets: &SecretSource, g: &mut Generation) -> 
         }
         // pf reaches every internal network's (dynamic, delegated) IPv6 prefix through the group
         line(&mut files, &n.ifname, &format!("group {LAN_GROUP}"));
+    }
+
+    // nobody on a bridged port may claim one of the router's addresses: a
+    // device answering ARP for them would be everyone's gateway
+    let mut vebs: BTreeMap<&str, (&[String], Vec<String>)> = BTreeMap::new();
+    for n in r.nets.iter() {
+        if let Some(b) = &n.bridge {
+            vebs.entry(b).or_insert((&n.members, vec![])).1.push(n.addr.to_string());
+        }
+    }
+    for (b, (members, addrs)) in vebs {
+        for m in members {
+            for a in &addrs {
+                line(&mut files, b, &format!("rule block in on {m} arp spa {a}"));
+            }
+        }
     }
 
     if let (Some(w), Some(cw)) = (&r.wan, &c.wan) {
@@ -130,12 +146,15 @@ pub(crate) fn render(r: &Router, secrets: &SecretSource, g: &mut Generation) -> 
     }
 
     if let Some(wg) = &c.wireguard {
-        let key = secrets.get(&wg.private_key)?;
+        let key = secrets.wg_key(&wg.private_key)?;
         line(&mut files, WG_IF, &format!("wgkey {key} wgport {}", wg.listen_port));
         for p in &wg.peers {
-            let mut l = format!("wgpeer {} wgaip {}/32 wgdescr \"{}\"", p.public_key, p.address, p.name);
+            if !octopus_config::check::wg_key_ok(&p.public_key) {
+                return Err(format!("wireguard peer {}: public_key is not a WireGuard key", p.name));
+            }
+            let mut l = format!("wgpeer {} wgaip {}/32 wgdescr \"{}\"", p.public_key, p.address, quote_safe(&p.name));
             if let Some(psk) = &p.preshared_key {
-                let _ = write!(l, " wgpsk {}", secrets.get(psk)?);
+                let _ = write!(l, " wgpsk {}", secrets.wg_key(psk)?);
             }
             line(&mut files, WG_IF, &l);
         }
@@ -173,6 +192,10 @@ pub(crate) fn render(r: &Router, secrets: &SecretSource, g: &mut Generation) -> 
     for (ifname, mut content) in files {
         // `up` last, after every address and option
         content.push_str("up\n");
+        // netstart evals every line as root: nothing in them may be shell syntax
+        if let Some(bad) = content.lines().find(|l| !hostname_line_ok(l)) {
+            return Err(format!("hostname.{ifname}: unsafe line {:?}", bad.split('\'').next().unwrap_or("")));
+        }
         let secret = secret_files.contains(&ifname);
         let f = g.file(format!("/etc/hostname.{ifname}"), content, Subsystem::Net);
         f.mode = if secret { 0o600 } else { 0o640 };
@@ -191,6 +214,30 @@ pub(crate) fn render(r: &Router, secrets: &SecretSource, g: &mut Generation) -> 
     Ok(())
 }
 
+/// A hostname.if(5) line as netstart reads it: words, `"..."` text without
+/// expansions, `'...'` values; `!` commands only as octopus writes them.
+fn hostname_line_ok(l: &str) -> bool {
+    if l.starts_with('#') || l.trim_end_matches('\\').trim().is_empty() {
+        return true;
+    }
+    let mut rest = String::new();
+    let mut quote = None;
+    for ch in l.chars() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(q), _) if ch == q => quote = None,
+            (Some('"'), '$' | '`' | '\\') => return false,
+            (Some(_), _) => {}
+            (None, _) => rest.push(ch),
+        }
+    }
+    let rest = rest.strip_prefix('!').unwrap_or(&rest);
+    quote.is_none()
+        && rest.trim_end_matches('\\').chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '\t' | '.' | ':' | '/' | '-' | '_' | '+' | '=' | '%' | ',')
+        })
+}
+
 fn quote_safe(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '"' | '\\' | '\n' | '\r' | '$' | '`')).collect()
+    s.chars().filter(|c| !c.is_control() && !matches!(c, '"' | '\\' | '$' | '`')).collect()
 }

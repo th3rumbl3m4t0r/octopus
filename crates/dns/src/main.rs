@@ -61,6 +61,8 @@ struct Config {
     views: Vec<ViewConf>,
     /// octopus-collector's DNS port: every answer goes there too (phase 6).
     collector: Option<SocketAddr>,
+    /// The (privileged) port they go from: the collector takes only those.
+    collector_from: Option<SocketAddr>,
     /// Where an upstream's refusal (0.0.0.0) points instead.
     sinkhole: Option<std::net::Ipv4Addr>,
 }
@@ -219,17 +221,32 @@ impl Handler {
             return vec![];
         }
         let keep = Duration::from_secs(ttl as u64).max(self.min_retention);
-        let expiry = Instant::now() + keep;
+        let now = Instant::now();
+        let expiry = now + keep;
+        // only addresses the table doesn't hold yet go to the pf helper (each
+        // request is a pfctl run as root); the others just live longer
+        let mut fresh = vec![];
         {
             let mut m = self.retained.lock().unwrap();
+            if m.len() >= MAX_RETAINED {
+                m.retain(|_, exp| *exp > now);
+            }
             for a in &addrs {
-                m.insert((*a, class), expiry);
+                if m.len() >= MAX_RETAINED && !m.contains_key(&(*a, class)) {
+                    break;
+                }
+                if m.insert((*a, class), expiry).is_none_or(|old| old <= now) {
+                    fresh.push(*a);
+                }
             }
         }
         let list: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
-        if let Some(h) = &self.helper {
+        let fresh: Vec<String> = fresh.iter().map(IpAddr::to_string).collect();
+        if let Some(h) = &self.helper
+            && !fresh.is_empty()
+        {
             // bounded wait: classification must not stall resolution
-            if let Err(e) = h.request(&self.classes[class].table, "add", &list, Duration::from_millis(300)).await {
+            if let Err(e) = h.request(&self.classes[class].table, "add", &fresh, Duration::from_millis(300)).await {
                 warn(&format!("pfhelper add {}: {e}", self.classes[class].table));
             }
         }
@@ -343,6 +360,32 @@ fn servfail(request: &Request) -> ResponseInfo {
 
 // ---- logging: JSON lines to syslog local5 (forwarded with everything else)
 
+/// Query log lines per client and second; more are counted, not logged
+/// (a flooding client would fill /var).
+const LOG_PER_CLIENT: u32 = 20;
+
+/// Lines logged per client in the current second: client -> (second, lines).
+type LogCounts = HashMap<IpAddr, (u64, u32)>;
+
+/// May this client's query be logged now?
+fn log_allowed(ip: IpAddr) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<LogCounts>> = std::sync::OnceLock::new();
+    let sec = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut seen = SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() > 10_000 {
+        seen.retain(|_, (s, _)| *s == sec);
+    }
+    let e = seen.entry(ip).or_insert((sec, 0));
+    if e.0 != sec {
+        if e.1 > LOG_PER_CLIENT {
+            warn(&format!("query log: {} line(s) from {ip} not logged in one second", e.1 - LOG_PER_CLIENT));
+        }
+        *e = (sec, 0);
+    }
+    e.1 += 1;
+    e.1 <= LOG_PER_CLIENT
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_query(
     src: SocketAddr,
@@ -355,6 +398,9 @@ fn log_query(
     start: Instant,
     class: Option<&str>,
 ) {
+    if !log_allowed(src.ip()) {
+        return;
+    }
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let v = serde_json::json!({
         "ts": (ts * 1000.0).round() / 1000.0,
@@ -471,6 +517,10 @@ fn sandbox(_: &[(&str, &str)]) -> Result<(), String> {
 
 type Retained = Arc<Mutex<HashMap<(IpAddr, usize), Instant>>>;
 
+/// Addresses kept for classification, all classes together: a client
+/// resolving endless names under a classified suffix fills no more.
+const MAX_RETAINED: usize = 65536;
+
 /// Every minute: forget expired addresses and rewrite each class table.
 /// The first pass (at start) empties tables left over from a previous run.
 async fn retention(helper: Arc<helper::Helper>, classes: Vec<Class>, retained: Retained) {
@@ -487,9 +537,18 @@ async fn retention(helper: Arc<helper::Helper>, classes: Vec<Class>, retained: R
             }
         }
         for (c, set) in classes.iter().zip(sets) {
-            let h = &helper;
-            if let Err(e) = h.request(&c.table, "replace", &set, Duration::from_secs(5)).await {
+            // the helper takes up to 8192 addresses a request: replace with the
+            // first of them, add the rest
+            let mut chunks = set.chunks(8192);
+            let first = chunks.next().unwrap_or_default();
+            if let Err(e) = helper.request(&c.table, "replace", first, Duration::from_secs(5)).await {
                 warn(&format!("pfhelper replace {}: {e}", c.table));
+                continue;
+            }
+            for more in chunks {
+                if let Err(e) = helper.request(&c.table, "add", more, Duration::from_secs(5)).await {
+                    warn(&format!("pfhelper add {}: {e}", c.table));
+                }
             }
         }
     }
@@ -549,6 +608,29 @@ async fn run(conf: &str, zonedir: Option<PathBuf>, validate: bool) -> Result<(),
         .collect();
     let helper = cfg.pfhelper.as_ref().map(|p| Arc::new(helper::Helper::new(p)));
     let retained: Retained = Arc::new(Mutex::new(HashMap::new()));
+    // every socket first, then down to _octodns, and only then serve: no
+    // query is ever parsed as root
+    let mut sockets = vec![];
+    for ip in &cfg.listen {
+        let addr = SocketAddr::new(*ip, cfg.port);
+        let udp = tokio::net::UdpSocket::bind(addr).await.map_err(|e| format!("udp {addr}: {e}"))?;
+        let tcp = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("tcp {addr}: {e}"))?;
+        sockets.push((udp, tcp));
+    }
+    let collector = match cfg.collector {
+        Some(to) => {
+            let from = cfg.collector_from.map_or("127.0.0.1:0".to_string(), |f| f.to_string());
+            let s = std::net::UdpSocket::bind(&from).map_err(|e| format!("collector socket {from}: {e}"))?;
+            s.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Some((s, to))
+        }
+        None => None,
+    };
+    let mut unveil = vec![("/etc/ssl", "r")];
+    if let Some(p) = &cfg.pfhelper {
+        unveil.push((p.as_str(), "rw"));
+    }
+    drop_privileges(&cfg.user, &unveil)?;
     if let Some(h) = &helper
         && !classes.is_empty()
     {
@@ -570,30 +652,15 @@ async fn run(conf: &str, zonedir: Option<PathBuf>, validate: bool) -> Result<(),
             retained,
             min_retention: Duration::from_secs(cfg.min_retention),
             sinkhole: cfg.sinkhole,
-            collector: match cfg.collector {
-                Some(to) => {
-                    let s = std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("collector socket: {e}"))?;
-                    s.set_nonblocking(true).map_err(|e| e.to_string())?;
-                    Some((s, to))
-                }
-                None => None,
-            },
+            collector,
         },
         [],
         cfg.allow.clone(),
     );
-    for ip in &cfg.listen {
-        let addr = SocketAddr::new(*ip, cfg.port);
-        let udp = tokio::net::UdpSocket::bind(addr).await.map_err(|e| format!("udp {addr}: {e}"))?;
+    for (udp, tcp) in sockets {
         server.register_socket(udp);
-        let tcp = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("tcp {addr}: {e}"))?;
         server.register_listener(tcp, Duration::from_secs(5), 32);
     }
-    let mut unveil = vec![("/etc/ssl", "r")];
-    if let Some(p) = &cfg.pfhelper {
-        unveil.push((p.as_str(), "rw"));
-    }
-    drop_privileges(&cfg.user, &unveil)?;
     warn(&format!(
         "listening on {} addresses port {}; {} zones; {} classes; views: default{}",
         cfg.listen.len(),

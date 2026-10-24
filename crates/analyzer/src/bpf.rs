@@ -6,6 +6,8 @@
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 
+use crate::pppoe::{self, Insn};
+
 // from <net/bpf.h> on OpenBSD 7.9 amd64 (checked against the headers)
 const BIOCSBLEN: libc::c_ulong = 0xc004_4266;
 const BIOCSETF: libc::c_ulong = 0x8010_4267;
@@ -13,14 +15,16 @@ const BIOCGDLT: libc::c_ulong = 0x4004_426a;
 const BIOCSETIF: libc::c_ulong = 0x8020_426c;
 const BIOCIMMEDIATE: libc::c_ulong = 0x8004_4270;
 const BIOCLOCK: libc::c_ulong = 0x2000_4276;
-pub const HDRLEN_AT: usize = 16;
-pub const CAPLEN_AT: usize = 8;
+const BIOCSDIRFILT: libc::c_ulong = 0x8004_427d;
+const BPF_DIRECTION_OUT: libc::c_uint = 1 << 1;
+/// bpf_setf refuses longer programs
+const BPF_MAXINSNS: libc::c_uint = 512;
 pub const BUFLEN: u32 = 1 << 20;
 
 #[repr(C)]
 struct BpfProgram {
     bf_len: libc::c_uint,
-    bf_insns: *mut libc::c_void,
+    bf_insns: *mut Insn,
 }
 
 #[link(name = "pcap")]
@@ -38,8 +42,8 @@ unsafe extern "C" {
     fn pcap_close(p: *mut libc::c_void);
 }
 
-/// Compile `filter` for link type `dlt`; Ok(()) proves it compiles.
-fn compile(filter: &str, dlt: i32, install_on: Option<RawFd>) -> Result<(), String> {
+/// libpcap's program for `filter` on link type `dlt`.
+fn program(filter: &str, dlt: i32) -> Result<Vec<Insn>, String> {
     let f = CString::new(filter).map_err(|_| "filter contains NUL")?;
     unsafe {
         let p = pcap_open_dead(dlt, 65535);
@@ -52,25 +56,44 @@ fn compile(filter: &str, dlt: i32, install_on: Option<RawFd>) -> Result<(), Stri
             pcap_close(p);
             return Err(format!("filter {filter:?}: {e}"));
         }
-        let mut res = Ok(());
-        if let Some(fd) = install_on
-            && libc::ioctl(fd, BIOCSETF, &prog) != 0
-        {
-            res = Err(format!("BIOCSETF: {}", std::io::Error::last_os_error()));
-        }
+        let insns = match prog.bf_insns.is_null() {
+            true => vec![],
+            false => std::slice::from_raw_parts(prog.bf_insns, prog.bf_len as usize).to_vec(),
+        };
         pcap_freecode(&mut prog);
         pcap_close(p);
-        res
+        Ok(insns)
     }
+}
+
+/// Compile `filter` for link type `dlt`; Ok(()) proves it compiles. On
+/// Ethernet it also matches inside PPPoE sessions (see pppoe.rs).
+fn compile(filter: &str, dlt: i32, install_on: Option<RawFd>) -> Result<(), String> {
+    let mut insns = program(filter, dlt)?;
+    if dlt == pppoe::DLT_EN10MB && !filter.is_empty() {
+        insns = pppoe::ethernet_filter(&insns, &program(filter, pppoe::DLT_PPP_ETHER)?)
+            .ok_or_else(|| format!("filter {filter:?}: no PPPoE program"))?;
+    }
+    if insns.len() > BPF_MAXINSNS as usize {
+        return Err(format!("filter {filter:?} compiles to {} instructions; bpf takes {BPF_MAXINSNS}", insns.len()));
+    }
+    if let Some(fd) = install_on {
+        let prog = BpfProgram { bf_len: insns.len() as libc::c_uint, bf_insns: insns.as_mut_ptr() };
+        if unsafe { libc::ioctl(fd, BIOCSETF, &prog) } != 0 {
+            return Err(format!("BIOCSETF: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 /// Check a filter compiles for Ethernet.
 pub fn check(filter: &str) -> Result<(), String> {
-    compile(filter, 1, None)
+    compile(filter, pppoe::DLT_EN10MB, None)
 }
 
 /// Open bpf on `ifname` with `filter`, lock it; returns (fd, link type).
-pub fn open(ifname: &str, filter: &str) -> Result<(RawFd, i32), String> {
+/// `inbound`: only what arrives on the interface, not what the router sends.
+pub fn open(ifname: &str, filter: &str, inbound: bool) -> Result<(RawFd, i32), String> {
     unsafe {
         let fd = libc::open(c"/dev/bpf".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
         if fd < 0 {
@@ -104,6 +127,10 @@ pub fn open(ifname: &str, filter: &str) -> Result<(RawFd, i32), String> {
         if libc::ioctl(fd, BIOCIMMEDIATE, &one) != 0 {
             return Err(fail("BIOCIMMEDIATE"));
         }
+        let out = BPF_DIRECTION_OUT;
+        if inbound && libc::ioctl(fd, BIOCSDIRFILT, &out) != 0 {
+            return Err(fail("BIOCSDIRFILT"));
+        }
         if let Err(e) = compile(filter, dlt as i32, Some(fd)) {
             libc::close(fd);
             return Err(e);
@@ -115,22 +142,4 @@ pub fn open(ifname: &str, filter: &str) -> Result<(RawFd, i32), String> {
     }
 }
 
-/// The records in one read(2) of a bpf descriptor:
-/// (seconds, microseconds, original length, captured frame).
-pub fn records(data: &[u8]) -> impl Iterator<Item = (u32, u32, u32, &[u8])> {
-    let mut off = 0usize;
-    std::iter::from_fn(move || {
-        if off + 18 > data.len() {
-            return None;
-        }
-        let word = |at: usize| u32::from_ne_bytes(data[off + at..off + at + 4].try_into().unwrap());
-        let (sec, usec, caplen, datalen) = (word(0), word(4), word(CAPLEN_AT) as usize, word(12));
-        let hdrlen = u16::from_ne_bytes(data[off + HDRLEN_AT..off + HDRLEN_AT + 2].try_into().unwrap()) as usize;
-        let (start, end) = (off + hdrlen, off + hdrlen + caplen);
-        if hdrlen == 0 || end > data.len() {
-            return None;
-        }
-        off += (hdrlen + caplen + 7) & !7;
-        Some((sec, usec, datalen, &data[start..end]))
-    })
-}
+pub use crate::bpfbuf::records;

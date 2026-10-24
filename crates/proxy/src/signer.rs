@@ -25,6 +25,8 @@ use crate::allow;
 
 const LEAF_DAYS: i64 = 7;
 const REFRESH: Duration = Duration::from_secs(24 * 3600);
+/// Leaves kept: a wildcard entry admits endless names.
+const CACHE: usize = 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,7 +100,14 @@ impl Signer {
             .map_err(|e| format!("signer key: {e}"))?;
         let signing = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| format!("signer key: {e}"))?;
         let ck = Arc::new(CertifiedKey::new(chain, signing));
-        self.cache.lock().unwrap().insert(host.to_string(), (ck.clone(), Instant::now()));
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= CACHE {
+            cache.retain(|_, (_, t)| t.elapsed() < REFRESH / 24);
+            if cache.len() >= CACHE {
+                cache.clear();
+            }
+        }
+        cache.insert(host.to_string(), (ck.clone(), Instant::now()));
         Ok(ck)
     }
 }

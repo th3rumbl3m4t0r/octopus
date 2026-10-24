@@ -155,8 +155,17 @@ impl SecretSource<'_> {
             }
         };
         // values end up inside single quotes in hostname.if(5) files
-        if v.is_empty() || v.contains(['\'', '\n', '\r', '\\', '\0']) {
-            return Err(format!("secret {reference}: empty or contains a quote, backslash or newline"));
+        if v.is_empty() || v.contains(['\'', '\\']) || v.chars().any(char::is_control) {
+            return Err(format!("secret {reference}: empty or contains a quote, backslash or control character"));
+        }
+        Ok(v)
+    }
+
+    /// A WireGuard key (32 bytes, base64): it is written unquoted.
+    fn wg_key(&self, reference: &str) -> Result<String, String> {
+        let v = self.get(reference)?;
+        if matches!(self, SecretSource::Real(_)) && !octopus_config::check::wg_key_ok(&v) {
+            return Err(format!("secret {reference}: not a WireGuard key (44 characters of base64)"));
         }
         Ok(v)
     }
@@ -177,6 +186,18 @@ pub fn render(r: &Router, secrets: &SecretSource) -> Result<Generation, String> 
     guard::render(r, &mut g);
     g.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(g)
+}
+
+/// Free text (descriptions, names) for a comment in a generated file: one
+/// line, printable, and no backslash, which pfctl and others read as a line
+/// continuation even inside a comment.
+pub(crate) fn comment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| *c != '\\')
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// `# header` lines for a config file.

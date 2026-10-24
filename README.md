@@ -22,7 +22,7 @@ Octopus's deviations at the top). Operations and cutover:
 | Binary | Runs as | What it does |
 |---|---|---|
 | `octopus` | root (CLI) | compile, check, diff, apply / confirm / rollback, generations, PKI, pfSense import |
-| `octopus-web` | `_octoweb` | web UI on the management addresses (x11 look); privileged actions only through six exact `doas` rules |
+| `octopus-web` | `_octoweb` | web UI on the management addresses (x11 look); privileged actions only through ten exact `doas` rules (deploy/doas.conf) |
 | `octopus-dns` | root → `_octodns` | DNS phase B: hickory-server with JSON query log, NXDOMAIN DoH canary, DNS-driven traffic classification |
 | `octopus-pfhelper` | root | the only path from unprivileged code to pf: add/delete/replace on allow-listed tables |
 | `octopus-proxy` | root → `_octoproxy` | servers' egress: SNI/Host allowlist, origins' certificates verified, leaves from the interception root minted by a separate signer process |
@@ -96,7 +96,7 @@ captures packets on demand.
 * **Least privilege.** Network-facing code runs unprivileged and pledged
   (`octopus-web`, `octopus-dns`, `octopus-proxy`, the collector and analyzer);
   root helpers are small and narrow (`octopus-pfhelper`: tables only;
-  `octopus` via doas: five fixed commands, plus the analyzer's one-shot
+  `octopus` via doas: ten fixed commands, among them the analyzer's one-shot
   capture).
 * **Management is internal.** The web UI listens on management addresses
   only and is not meant to be exposed: it has sessions, bcrypt logins and a

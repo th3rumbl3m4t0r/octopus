@@ -9,6 +9,11 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
 
 say() { print -r -- "octopus install.site: $*"; }
 
+# ---- first: an unconfirmed generation must not survive a reboot, whatever
+# fails below
+touch /etc/rc.local
+grep -q 'octopus boot' /etc/rc.local || print '/usr/local/sbin/octopus boot' >> /etc/rc.local
+
 # ---- users: fixed ids so ownership survives reinstalls
 grep -q '^_octodns:' /etc/group || groupadd -g 860 _octodns
 id _octodns >/dev/null 2>&1 || useradd -u 860 -g 860 -c "Octopus DNS" -d /var/empty -s /sbin/nologin _octodns
@@ -29,14 +34,23 @@ install -d -o root -g wheel -m 700 /var/octopus/gen
 install -d -o _octoweb -g _octoweb -m 700 /var/octopus/staged
 install -d -o _octoflow -g _octoflow -m 750 /var/octopus/pcap
 
-# ---- shipped files
+# ---- shipped files: root's, whatever the set said (and the directories
+# they are in: a set from an older mksite.sh carried them with its owner)
+chown root:wheel /etc /etc/rc.d /usr/local /usr/local/sbin /var /root
+chmod 755 /etc /etc/rc.d /usr/local /usr/local/sbin /var
+chmod 700 /root
 bins="octopus octopus-web octopus-pfhelper octopus-dns octopus-proxy octopus-collector octopus-analyzer hickory-dns"
 for b in $bins; do
 	chown root:wheel /usr/local/sbin/$b
 	chmod 555 /usr/local/sbin/$b
 done
-chmod 555 /etc/rc.d/octopus_hickory /etc/rc.d/octopus_dns /etc/rc.d/octopus_web /etc/rc.d/octopus_pfhelper \
-    /etc/rc.d/octopus_filterlog /etc/rc.d/octopus_proxy /etc/rc.d/octopus_collector /etc/rc.d/octopus_analyzer
+for s in /etc/rc.d/octopus_*; do
+	chown root:wheel "$s"
+	chmod 555 "$s"
+done
+chown root:wheel /etc/octopus/doas.conf
+chmod 644 /etc/octopus/doas.conf
+[ -d /var/octopus/packages ] && chown -R root:wheel /var/octopus/packages
 install -d -o root -g wheel -m 700 /etc/octopus/syslog
 # the phase A script was called octopus_dns before octopus-dns existed
 if grep -q hickory-dns /etc/rc.d/octopus_dns 2>/dev/null; then
@@ -50,7 +64,10 @@ for l in octopus-dns octopus-proxy octopus-flows octopus-analyzer; do
 	grep -q "^/var/log/$l" /etc/newsyslog.conf ||
 	    print "/var/log/$l\t\t\t640  14    10000 *     Z" >> /etc/newsyslog.conf
 done
-[ -f /etc/octopus/router.toml ] && chmod 644 /etc/octopus/router.toml
+if [ -f /etc/octopus/router.toml ]; then
+	chown root:wheel /etc/octopus/router.toml
+	chmod 644 /etc/octopus/router.toml
+fi
 if [ -f /etc/octopus/secrets.toml ]; then
 	chown root:wheel /etc/octopus/secrets.toml
 	chmod 600 /etc/octopus/secrets.toml
@@ -90,25 +107,39 @@ fi
 chown root:_octoweb /etc/octopus/web/users
 chmod 640 /etc/octopus/web/users
 
-# ---- doas: the web UI's exact commands, and wheel for the owner
+# ---- doas: the web UI's exact commands, as one block that each run
+# replaces (a rule a release drops is gone after the upgrade too); wheel for
+# the owner only on a fresh system. Checked before it is put in place.
 touch /etc/doas.conf
-if ! grep -q '^permit persist :wheel' /etc/doas.conf; then
-	print 'permit persist :wheel' >> /etc/doas.conf
+new=$(mktemp /etc/.doas.conf.XXXXXX)
+fresh=0
+[ -s /etc/doas.conf ] || fresh=1
+# everything but our block and our rules from before the block existed
+sed -e '/^# BEGIN octopus/,/^# END octopus/d' -e '/^permit nopass _octoweb as root /d' /etc/doas.conf > "$new"
+[ "$fresh" = 1 ] && print 'permit persist :wheel' >> "$new"
+{
+	print '# BEGIN octopus: replaced by install.site, edit deploy/doas.conf'
+	grep '^permit' /etc/octopus/doas.conf
+	print '# END octopus'
+} >> "$new"
+chown root:wheel "$new"
+chmod 600 "$new"
+if doas -C "$new"; then
+	mv "$new" /etc/doas.conf
+else
+	rm -f "$new"
+	say "the new doas rules have errors; /etc/doas.conf is unchanged"
+	exit 1
 fi
-# rule by rule, so an upgrade adds the new ones
-grep '^permit' /etc/octopus/doas.conf | while read -r rule; do
-	grep -qxF "$rule" /etc/doas.conf || print -r -- "$rule" >> /etc/doas.conf
-done
-chown root:wheel /etc/doas.conf
-chmod 600 /etc/doas.conf
-doas -C /etc/doas.conf || { say "doas.conf has errors"; exit 1; }
 
 # ---- packages shipped in the site set (nginx for [[vhosts]])
 if [ -d /var/octopus/packages ] && ls /var/octopus/packages/*.tgz >/dev/null 2>&1; then
 	PKG_PATH=/var/octopus/packages pkg_add -I nginx || say "WARNING: pkg_add nginx failed"
 	PKG_PATH=/var/octopus/packages pkg_add -I kea || say "WARNING: pkg_add kea failed"
 fi
-install -d -o root -g wheel -m 755 /etc/octopus/pki /etc/octopus/pki/leaf
+# the intermediate's key lives here: root's alone
+install -d -o root -g wheel -m 700 /etc/octopus/pki
+install -d -o root -g wheel -m 755 /etc/octopus/pki/leaf
 
 # ---- leaves from the services intermediate: renewed daily
 touch /etc/daily.local
@@ -118,14 +149,24 @@ touch /etc/daily.local
 grep -q 'octopus pki renew' /etc/daily.local ||
     print '/usr/local/sbin/octopus pki renew 2>&1 | logger -t octopus-pki' >> /etc/daily.local
 
-# ---- an unconfirmed generation must not survive a reboot
-touch /etc/rc.local
-grep -q 'octopus boot' /etc/rc.local || print '/usr/local/sbin/octopus boot' >> /etc/rc.local
+# ---- daemons that died start again (every 5 minutes)
+if ! crontab -l -u root 2>/dev/null | grep -q 'octopus supervise'; then
+	{ crontab -l -u root 2>/dev/null; print '*/5\t*\t*\t*\t*\t/usr/local/sbin/octopus supervise 2>&1 | logger -t octopus-supervise'; } | crontab -u root -
+fi
 
-# ---- first boot: apply router.toml once the real interfaces are up
+# ---- nginx's logs: rotated by size too, and nginx (not httpd) told to reopen them
+if [ -x /usr/local/sbin/nginx ] && grep -q '^/var/www/logs/access.log' /etc/newsyslog.conf; then
+	sed -i -e '/^\/var\/www\/logs\/access\.log/s/-x httpd/-x nginx/' \
+	    -e '/^\/var\/www\/logs\/error\.log/s/-x httpd/-x nginx/' \
+	    -e '/^\/var\/www\/logs\/access\.log/s/\(644  *[0-9][0-9]*  *\)\*/\110000/' /etc/newsyslog.conf
+fi
+
+# ---- first boot: apply router.toml once the real interfaces are up, with a
+# confirm window of 30 minutes: unconfirmed, it reverts to the installer's
+# network (generation 0). `octopus boot` in rc.local leaves it to its watchdog.
 if [ "${OCTOPUS_LIVE:-0}" != 1 ]; then
 	grep -q 'octopus apply' /etc/rc.firsttime 2>/dev/null ||
-	    print '/usr/local/sbin/octopus apply --no-confirm 2>&1 | logger -t octopus-firstboot' >> /etc/rc.firsttime
+	    print '/usr/local/sbin/octopus apply --timeout 1800 2>&1 | logger -t octopus-firstboot' >> /etc/rc.firsttime
 fi
 
 say "done"

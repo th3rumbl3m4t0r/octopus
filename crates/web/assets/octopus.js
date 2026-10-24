@@ -41,6 +41,8 @@
     toastTimer = setTimeout(function () { el.hidden = true; }, cls === 'bad' ? 8000 : 3000);
   }
 
+  // a number from a log line: digits, or nothing (never markup)
+  function num(v) { var n = Number(v); return isFinite(n) ? String(n) : ''; }
   function api(method, path, body) {
     var opt = { method: method, headers: { 'X-Octopus': '1' }, credentials: 'same-origin' };
     if (body !== undefined) {
@@ -91,9 +93,11 @@
     }
     parts.push('<span>' + esc(s.pf.states) + ' states</span>');
     parts.push('<span>gen ' + esc(s.state.current) + (s.state.confirmed !== s.state.current ? ' (confirmed ' + esc(s.state.confirmed) + ')' : '') + '</span>');
-    if (s.state.pending) {
-      parts.push('<span class="count">&#9679; generation ' + esc(s.state.pending.gen) + ' rolls back in ' + esc(s.state.pending.remaining) + 's</span>');
+    var pd = s.state.pending;
+    if (pd) {
+      parts.push('<span class="count">&#9679; generation ' + esc(pd.gen) + (pd.reverting ? ' is being rolled back' : pd.applying ? ' is being applied' : ' rolls back in ' + esc(pd.remaining) + 's') + '</span>');
     }
+    if (s.state.error) parts.push('<span class="bad">' + esc(s.state.error) + '</span>');
     var failed = (s.services || []).filter(function (x) { return x.enabled && !x.running; });
     if (failed.length) parts.push('<span class="bad">' + failed.map(function (x) { return esc(x.name); }).join(' ') + ' down</span>');
     parts.push('<span class="spacer"></span>');
@@ -101,10 +105,13 @@
     $('statusbar').innerHTML = parts.join('');
     var p = $('pending');
     if (p) {
-      p.hidden = !s.state.pending;
-      if (s.state.pending) {
-        $('pending-text').textContent = 'generation ' + s.state.pending.gen + ' is live and rolls back to ' +
-          s.state.pending.previous + ' in ' + s.state.pending.remaining + ' s unless confirmed.';
+      p.hidden = !pd;
+      if (pd) {
+        $('pending-text').textContent = pd.reverting ? 'generation ' + pd.gen + ' is being rolled back to ' + pd.previous + '.' :
+          pd.applying ? 'generation ' + pd.gen + ' is being applied.' :
+          'generation ' + pd.gen + ' is live and rolls back to ' + pd.previous + ' in ' + pd.remaining + ' s unless confirmed.';
+        var cb = $('btn-confirm');
+        if (cb) cb.disabled = !!(pd.reverting || pd.applying);
       }
     }
   }
@@ -183,11 +190,11 @@
         }));
       var top = function (id, head, list) {
         table(id, [head, '#queries'], (list || []).map(function (x) {
-          return '<tr>' + td(esc(x.name)) + td(x.count, 'num') + '</tr>';
+          return '<tr>' + td(esc(x.name)) + td(num(x.count), 'num') + '</tr>';
         }));
       };
       table('t-names', ['name', '#queries'], (d.top_names || []).map(function (x) {
-        return '<tr>' + td('<a href="#" data-qname="' + esc(x.name) + '" title="override this name">' + esc(x.name) + '</a>') + td(x.count, 'num') + '</tr>';
+        return '<tr>' + td('<a href="#" data-qname="' + esc(x.name) + '" title="override this name">' + esc(x.name) + '</a>') + td(num(x.count), 'num') + '</tr>';
       }));
       top('t-clients', 'client', d.top_clients);
       top('t-classes', 'class', d.classes);
@@ -198,12 +205,12 @@
       if (!f) { $('flows-summary').textContent = 'no flow log: set [logging] pflow = "127.0.0.1:2055"'; return; }
       $('flows-summary').textContent = f.flows + ' flows in the log tail, ' + f.labelled + ' with a name';
       table('t-flows', ['ended (UTC)', 'from', 'to', 'proto', 'name', '#packets', '#bytes'], (f.recent || []).map(function (x) {
-        return '<tr>' + td(esc(when(x.end).slice(11)), 'dim') + td(esc(x.src) + '<span class="dim">:' + x.sport + '</span>') +
-          td(esc(x.dst) + '<span class="dim">:' + x.dport + '</span>') + td(esc(x.proto), 'dim') +
-          td(esc(x.name || ''), x.name ? '' : 'dim') + td(x.packets, 'num') + td(bytes(x.bytes), 'num') + '</tr>';
+        return '<tr>' + td(esc(when(x.end).slice(11)), 'dim') + td(esc(x.src) + '<span class="dim">:' + num(x.sport) + '</span>') +
+          td(esc(x.dst) + '<span class="dim">:' + num(x.dport) + '</span>') + td(esc(x.proto), 'dim') +
+          td(esc(x.name || ''), x.name ? '' : 'dim') + td(num(x.packets), 'num') + td(bytes(x.bytes), 'num') + '</tr>';
       }));
       var top = function (id, head, list) {
-        table(id, [head, '#bytes'], (list || []).map(function (x) { return '<tr>' + td(esc(x.name)) + td(bytes(x.count), 'num') + '</tr>'; }));
+        table(id, [head, '#bytes'], (list || []).map(function (x) { return '<tr>' + td(esc(x.name)) + td(bytes(Number(x.count)), 'num') + '</tr>'; }));
       };
       top('t-fnames', 'name', f.top_names);
       top('t-fclients', 'client', f.top_clients);
@@ -217,7 +224,7 @@
         return '<tr>' + td(esc(when(x.ts).slice(11)), 'dim') + td(esc(x.net), 'dim') + td(esc(x.client)) + td(esc(x.host)) +
           td(esc(x.action), x.action === 'block' ? 'bad' : 'ok') + td(what, 'dim') + '</tr>';
       }));
-      table('t-phosts', ['host', '#decisions'], (p.top_hosts || []).map(function (x) { return '<tr>' + td(esc(x.name)) + td(x.count, 'num') + '</tr>'; }));
+      table('t-phosts', ['host', '#decisions'], (p.top_hosts || []).map(function (x) { return '<tr>' + td(esc(x.name)) + td(num(x.count), 'num') + '</tr>'; }));
     },
     analyzer: function (s) {
       options($('cap-if'), (s.interfaces || []).filter(function (i) { return i.name.indexOf('lo') !== 0; }).map(function (i) {
@@ -227,8 +234,8 @@
       if (!a) { $('an-summary').textContent = 'octopus-analyzer has not run yet'; return; }
       $('an-summary').textContent = a.matches + ' matches in the log tail';
       table('t-amatch', ['time (UTC)', 'rule', 'from', 'to', 'proto', '#len', 'action'], (a.recent || []).filter(function (x) { return x.rule; }).map(function (x) {
-        return '<tr>' + td(esc(when(x.ts).slice(11)), 'dim') + td(esc(x.rule)) + td(esc(x.src) + '<span class="dim">:' + x.sport + '</span>') +
-          td(esc(x.dst) + '<span class="dim">:' + x.dport + '</span>') + td(esc(x.proto), 'dim') + td(x.len, 'num') +
+        return '<tr>' + td(esc(when(x.ts).slice(11)), 'dim') + td(esc(x.rule)) + td(esc(x.src) + '<span class="dim">:' + num(x.sport) + '</span>') +
+          td(esc(x.dst) + '<span class="dim">:' + num(x.dport) + '</span>') + td(esc(x.proto), 'dim') + td(num(x.len), 'num') +
           td(esc(x.action), x.action === 'block' ? 'bad' : '') + '</tr>';
       }));
       var lb = (s.pf.tables || []).filter(function (t) { return t.name === 'lab_block'; })[0];
@@ -282,7 +289,10 @@
     }
     var grid = '';
     for (var i = 1; i < 4; i++) grid += '<line class="grid" x1="0" x2="' + W + '" y1="' + H * i / 4 + '" y2="' + H * i / 4 + '"/>';
-    $('tr-graph').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img" aria-label="traffic on ' +
+    // the scale on the side: top, middle and zero of the 1-2-5 scale
+    var scale = '<div class="scale dim"><span>' + rate(max).replace('.0 ', ' ') + '</span><span>' + rate(max / 2).replace('.0 ', ' ') +
+      '</span><span>0</span></div>';
+    $('tr-graph').innerHTML = scale + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img" aria-label="traffic on ' +
       esc(d['if']) + '">' + grid + '<path class="rx" d="' + path(1) + '"/><path class="tx" d="' + path(2) + '"/></svg>';
     $('tr-axis').innerHTML = day ? '<span>-24 h</span><span>-12 h</span><span>now</span>' : '<span>-60 min</span><span>-30 min</span><span>now</span>';
     var lp = pts[pts.length - 1];
@@ -343,6 +353,19 @@
       return ' data-' + k + '="' + esc(attrs[k]) + '"';
     }).join('') + ' title="' + esc(title) + '">&times;</button>';
   }
+  // what an apply said: only a pending generation needs a confirm; a lost
+  // answer (reload, network) says nothing about what the router did
+  function applyToast(r, failHint) {
+    var pending = /is live; run `octopus confirm`/.test(r.output || ''), none = /^no changes$/m.test(r.output || '');
+    if (!r.ok) return toast('apply failed', /still running/.test(r.output || '') ? r.output : failHint, 'bad');
+    if (none) return toast('no changes', 'the router already runs this', 'ok');
+    toast('applied', pending ? 'confirm within 60 s' : 'see the status page', pending ? 'warn' : 'ok');
+  }
+  function applyLost(e) {
+    // refused before anything ran (a stale text): say so, not "unknown"
+    if (/changed on the router/.test(e.message)) return toast('not applied', e.message, 'bad');
+    toast('apply: outcome unknown', e.message + '; check the status page before trying again', 'bad');
+  }
   function startOver() {
     // router.toml follows the live generation now: start over from it
     sessionStorage.removeItem(WORK_KEY);
@@ -362,15 +385,15 @@
     $('btn-wapply').addEventListener('click', function () {
       if (!confirm('Apply these changes? They roll back automatically unless confirmed within 60 seconds.')) return;
       var b = this; busy(b, true);
-      api('POST', '/api/apply', { toml: work.toml }).then(function (r) {
-        toast(r.ok ? 'applied' : 'apply failed', r.ok ? 'confirm within 60 s' : 'see unapplied changes', r.ok ? 'warn' : 'bad');
+      api('POST', '/api/apply', { toml: work.toml, base: work.base }).then(function (r) {
+        applyToast(r, 'see unapplied changes');
         if (r.ok) startOver();
         else {
           out.hidden = false;
           out.textContent = r.output;
         }
         refresh();
-      }).catch(function (e) { toast('apply', e.message, 'bad'); }).then(function () { busy(b, false); showWork(); });
+      }).catch(applyLost).then(function () { busy(b, false); showWork(); });
     });
     $('btn-wdiscard').addEventListener('click', function () {
       if (!confirm('Discard ' + work.edits.length + ' unapplied change(s)?')) return;
@@ -839,7 +862,8 @@
   // new-rule box; a row starts the box from it, an entry of the file
   // (rules, forwards, links) is edited in place
   var policy = null, fwAt = null;
-  var SECTIONS = { 'in': 'from the internet', out: 'from inside out', internal: 'between tiers and to the router' };
+  var SECTIONS = { 'in': 'from the internet', rules: 'your rules, first match, in this order (after each tier\'s guard and DoT block)',
+    out: 'from inside out', internal: 'between tiers and to the router' };
   var ACTION_CLASS = { allow: 'ok', deny: 'bad', nat: 'warn', redirect: 'warn', proxy: 'warn' };
   function loadPolicy() {
     if (!work) return;
@@ -852,14 +876,20 @@
     var hits = {};
     ((s && s.pf.labels) || []).forEach(function (l) { hits[l.label] = l; });
     var head = ['source', 'destination', 'service', 'action', '#packets', '#bytes', 'note'], rows = [];
-    ['in', 'out', 'internal'].forEach(function (sec) {
+    // counters belong to the running rules: a working copy that moved
+    // rules around would show them on the wrong rows
+    var moved = work && work.edits.length;
+    ['in', 'rules', 'out', 'internal'].forEach(function (sec) {
       policy.forEach(function (r, i) {
         if (r.section !== sec) return;
         if (!rows.length || rows[rows.length - 1].sec !== sec) {
           rows.push({ sec: sec, html: '<tr class="section"><th colspan="' + head.length + '">' + esc(SECTIONS[sec]) + '</th></tr>' });
         }
         var p = 0, b = 0, known = false;
-        r.labels.forEach(function (l) { if (hits[l]) { p += hits[l].packets; b += hits[l].bytes; known = true; } });
+        r.labels.forEach(function (l) {
+          if (moved && /^(rule|link):/.test(l)) return;
+          if (hits[l]) { p += hits[l].packets; b += hits[l].bytes; known = true; }
+        });
         var mark = r.ref ? ' <span class="dim" title="in router.toml: click to edit">&#9998;</span>' : '';
         rows.push({ sec: sec, html: '<tr data-i="' + i + '" title="' + esc(r.labels.join(' ')) + '">' + td(esc(r.source)) + td(esc(r.destination)) + td(esc(r.service)) +
           td(esc(r.action) + mark, ACTION_CLASS[r.action]) + td(known ? p : '', p ? 'num' : 'num dim') + td(known ? bytes(b) : '', b ? 'num' : 'num dim') +
@@ -1105,7 +1135,7 @@
     var box = h('div', { class: 'form newnet', hidden: true }, [
       h('label', { class: 'lbl req', text: 'new tier' }), h('div', { class: 'fld' }, [name, h('div', { class: 'help', text: 'its name in router.toml' })]),
       h('label', { class: 'lbl req', text: 'router address' }), h('div', { class: 'fld' }, [addr, h('div', { class: 'help', text: 'the router in the new range and its size, e.g. 192.168.3.1/24; DHCP hands out the rest' })]),
-      h('label', { class: 'lbl', text: 'vlan' }), h('div', { class: 'fld' }, [tag, h('div', { class: 'help', text: 'the tag it travels with between router and access points' })]),
+      h('label', { class: 'lbl', text: 'vlan' }), h('div', { class: 'fld' }, [tag, h('div', { class: 'help', text: 'the tag it travels with between router and access points; every house port carries it unless the tier lists its ports, and a wired device can tag itself into it' })]),
       h('label', { class: 'lbl', text: 'kind' }), h('div', { class: 'fld' }, [kind])
     ].concat(where));
     function ip(n) { return [n >>> 24, n >>> 16 & 255, n >>> 8 & 255, n & 255].join('.'); }
@@ -1390,7 +1420,7 @@
   }
 
   function configPage() {
-    var ta = $('config-text');
+    var ta = $('config-text'), base = ta.value;
     var out = $('out'), outTitle = $('out-title');
     function show(title, html) { outTitle.textContent = title; out.innerHTML = html; }
 
@@ -1413,16 +1443,16 @@
     $('btn-apply').addEventListener('click', function () {
       if (!confirm('Apply this configuration? It rolls back automatically unless confirmed within 60 seconds.')) return;
       var b = this; busy(b, true);
-      api('POST', '/api/apply', { toml: ta.value }).then(function (r) {
+      api('POST', '/api/apply', { toml: ta.value, base: base }).then(function (r) {
         show('apply', '<pre>' + esc(r.output) + '</pre>');
-        toast(r.ok ? 'applied' : 'apply failed', r.ok ? 'confirm within 60 s' : 'see the output window', r.ok ? 'warn' : 'bad');
-        if (r.ok) startOver();
+        applyToast(r, 'see the output window');
+        if (r.ok) { startOver(); api('GET', '/api/config').then(function (c) { base = c.toml; }); }
         refresh();
-      }).catch(function (e) { toast('apply', e.message, 'bad'); }).then(function () { busy(b, false); });
+      }).catch(applyLost).then(function () { busy(b, false); });
     });
 
     $('btn-reload').addEventListener('click', function () {
-      api('GET', '/api/config').then(function (r) { ta.value = r.toml; toast('reloaded', 'router.toml from the router', 'ok'); });
+      api('GET', '/api/config').then(function (r) { ta.value = r.toml; base = r.toml; toast('reloaded', 'router.toml from the router', 'ok'); });
     });
   }
 

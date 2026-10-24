@@ -18,3 +18,4 @@ libc.workspace = true
 pcre2 = "0.2"
 octopus-config.workspace = true
 etherparse = "0.21"
+ipnet.workspace = true

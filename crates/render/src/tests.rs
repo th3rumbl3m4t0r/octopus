@@ -21,7 +21,7 @@ fn kea(g: &crate::Generation) -> serde_json::Value {
 }
 
 fn secrets() -> Secrets {
-    Secrets::parse("pppoe_user = \"user@isp\"\npppoe_pass = \"s3cr3t-pw\"\nwg_key = \"WGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEY0=\"").unwrap()
+    Secrets::parse("pppoe_user = \"user@isp\"\npppoe_pass = \"s3cr3t-pw\"\nwg_key = \"WGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWG0=\"").unwrap()
 }
 
 #[test]
@@ -588,7 +588,13 @@ fn tiers_on_the_house_ports() {
     );
     assert_eq!(pf.matches("label \"rule:4\"").count(), 3, "once on each interface (vport0 carries two tiers)");
     assert!(pf.contains("pass in quick on $if_cd from 192.168.1.0/24 label \"cd:open\""));
-    assert!(pf.contains("pass in quick on $if_dd proto udp from port bootpc to port bootps label \"dd:dhcp\""));
+    assert!(pf.contains(
+        "pass in quick on $if_dd proto udp from port bootpc to { 255.255.255.255 self } port bootps label \"dd:dhcp\""
+    ));
+    // every tier's guard and DoT block on a shared interface comes before any rule on it
+    let cd = pf.find("# ---- cd").unwrap();
+    let first_rule = cd + pf[cd..].find("label \"rule:").unwrap();
+    assert!(pf[cd..first_rule].contains("label \"dd:dot\""), "{pf}");
 
     // Kea: CD by MAC class, DD for the rest, on one shared network; Wi-Fi and guests alone
     let k = kea(&g);
@@ -663,4 +669,187 @@ fn old_generations_stay_readable() {
     assert_eq!(s, crate::Subsystem::Proxy);
     let s: crate::Subsystem = serde_json::from_str("\"something-new\"").unwrap();
     assert_eq!(s, crate::Subsystem::Other);
+}
+
+/// check() errors for a file built from the example plus `edit`.
+fn check_errors(text: &str) -> Vec<String> {
+    let cfg = match parse(text) {
+        Ok(c) => c,
+        Err(e) => return vec![format!("parse: {e}")],
+    };
+    let r = Router::resolve(cfg, &BTreeMap::new()).expect("resolve");
+    check(&r, None).errors().map(|e| format!("{}: {}", e.code, e.msg)).collect()
+}
+
+#[test]
+fn free_text_never_becomes_syntax() {
+    // each of these once reached a root-read file as extra lines or shell syntax
+    let cases = [
+        // rc.subr runs syslogd's flags through sh
+        ("[logging]\n", "[logging]\ntls_ca = \"/etc/ca.crt$(touch${IFS}/tmp/x)\"\n"),
+        // netstart evals hostname.wg0
+        ("name = \"laptop\"", "name = \"laptop$(touch /tmp/x)\""),
+        ("xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", "xTIBA5rboUvnH4htodjb6e697QjLE;touch /tmp/x;#="),
+        // sshd_config, pf.conf labels, syslog.conf, ntpd.conf
+        ("[ntp]\n", "[ssh]\nroot_login = \"no\\nAuthorizedKeysCommand /bin/echo\"\n\n[ntp]\n"),
+        ("name = \"nas-ssh\"", "name = \"nas\\\"\\npass in quick on $wan all label \\\"x\""),
+        ("remote = [\"tls://10.10.0.5:6514\"]", "remote = [\"tls://10.10.0.5\\n*.* |/bin/sh\"]"),
+        ("remote = [\"tls://10.10.0.5:6514\"]", "remote = [\"tls://log;x\"]"),
+        ("servers = [\"ntp.nic.cz\", \"time.cloudflare.com\"]", "servers = [\"ntp.nic.cz\\nlisten on *\"]"),
+        (
+            "servers = [\"ntp.nic.cz\", \"time.cloudflare.com\"]",
+            "servers = [\"ntp.nic.cz\"]\nconstraints = [\"https://a\\\"\"]",
+        ),
+        ("description = \"offsite backup\"", "description = \"offsite\\nbackup\""),
+    ];
+    for (from, to) in cases {
+        assert!(EXAMPLE.contains(from), "{from}");
+        let errs = check_errors(&EXAMPLE.replacen(from, to, 1));
+        assert!(!errs.is_empty(), "accepted: {to}");
+    }
+    // a vhost's name is in comments even when hostnames are set
+    let v = format!(
+        "{EXAMPLE}\n[[vhosts]]\nname = \"site\\n\\tX on;\"\nhostnames = [\"app.home.arpa\"]\nupstream = \"http://10.30.0.10:80\"\n"
+    );
+    assert!(!check_errors(&v).is_empty());
+    let v = format!("{EXAMPLE}\n[[vhosts]]\nname = \"site\"\nupstream = \"http://10.30.0.10:80;x\"\n");
+    assert!(!check_errors(&v).is_empty());
+}
+
+#[test]
+fn a_trailing_backslash_never_hides_a_rule() {
+    // pfctl joins a comment ending in `\` with the next line
+    let text = EXAMPLE
+        .replace("description = \"lan may use the file server\"", "description = \"C:\\\\\"")
+        .replace("description = \"office egress addresses\"", "description = \"\\\\\\\\share\\\\\"")
+        + "\n[[rules]]\nnetwork = \"lan\"\naction = \"block\"\nto = \"10.30.0.11\"\n";
+    let g = render(&router(&text), &SecretSource::Placeholder).unwrap();
+    let pf = &g.get("/etc/pf.conf").unwrap().content;
+    assert!(!pf.contains("C:\\"), "{pf}");
+    let wrapped_tables = pf.lines().filter(|l| l.ends_with('\\') && !l.starts_with("table") && !l.starts_with('\t'));
+    assert_eq!(wrapped_tables.count(), 0, "{pf}");
+    assert!(pf.lines().any(|l| l.starts_with("block drop in quick on $if_lan") && l.contains("label \"rule:2\"")));
+}
+
+#[test]
+fn hostname_files_are_plain() {
+    let s = Secrets::parse(
+        "pppoe_user = \"u;x\"\npppoe_pass = \"p$(x)\"\nwg_key = \"WGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWGKEYWG0=\"",
+    )
+    .unwrap();
+    // inside single quotes nothing is expanded: allowed
+    let g = render(&router(EXAMPLE), &SecretSource::Real(&s)).unwrap();
+    assert!(g.get("/etc/hostname.pppoe0").unwrap().content.contains("authname 'u;x' authkey 'p$(x)'"));
+    // a WireGuard key is unquoted: only base64
+    let s = Secrets::parse("pppoe_user = \"u\"\npppoe_pass = \"p\"\nwg_key = \"k;reboot;#\"").unwrap();
+    assert!(render(&router(EXAMPLE), &SecretSource::Real(&s)).is_err());
+}
+
+#[test]
+fn ipv6_on_tiers_keeps_their_borders() {
+    // only CD manages the router; DD is every other cable
+    let text = TIERS.replace("from = \"internal\"\nto = \"self\"", "from = \"net:cd\"\nto = \"self\"")
+        + "\n[ipv6]\nmode = \"pd\"\n";
+    let g = render(&router(&text), &SecretSource::Placeholder).unwrap();
+    let pf = &g.get("/etc/pf.conf").unwrap().content;
+    let mgmt: Vec<&str> = pf.lines().filter(|l| l.contains("label \"rule:4\"") && l.contains("on $if_cd")).collect();
+    // CD by its IPv4 range: vport0:network would cover DD's alias and the shared /64
+    assert_eq!(
+        mgmt,
+        [
+            "pass in quick on $if_cd inet proto tcp from 192.168.1.0/24 to self port { 22 8443 } label \"rule:4\" source limiter \"clients\"\t# managing the router"
+        ]
+    );
+    assert!(!pf.contains("from ($if_cd:network)"), "{pf}");
+    // guests: nothing inside over IPv6 either (the delegated prefixes aren't in <internal>)
+    assert!(pf.contains(
+        "block drop in quick on $if_guest inet6 from ($if_guest:network) to (octolan:network) label \"rule:3\""
+    ));
+    // the shared /64 is DD's: its DoT block and its policy, after DD's guard
+    assert!(pf.contains("block in log quick on $if_cd inet6 proto { tcp udp } to ! self port 853 label \"dd:dot\""));
+    // the prefix request leaves on the WAN: its multicast destination is a martian
+    let solicit = pf
+        .find("pass out quick on $wan inet6 proto udp from fe80::/10 port dhcpv6-client to ff02::1:2 port dhcpv6-server")
+        .expect(pf);
+    assert!(solicit < pf.find("block out quick on $wan inet6 to <martians6>").unwrap(), "{pf}");
+    let guard = pf.find("inet6 proto tcp to self port $mgmt_ports label \"dd:guard\"").unwrap();
+    assert!(guard < pf.find("pass in quick on $if_cd inet6 label \"dd:open\"").unwrap());
+    // `internet` over IPv6 is everything but the tiers
+    let out = text.clone()
+        + "\n[[rules]]\nnetwork = \"all\"\naction = \"pass\"\nfrom = \"net:wifi\"\nto = \"internet\"\nproto = \"tcp\"\nport = 443\n";
+    let pf = render(&router(&out), &SecretSource::Placeholder).unwrap().get("/etc/pf.conf").unwrap().content.clone();
+    assert!(pf.contains("inet6 proto tcp from ($if_wifi:network) to ! (octolan:network) port 443"), "{pf}");
+    assert!(pf.contains("inet proto tcp from ($if_wifi:network) to ! <internal> port 443"), "{pf}");
+    // an IPv4 address to `internet`: the IPv4 line only (pfctl refuses `inet6 from 192.168.3.41`)
+    let host = text.clone()
+        + "\n[[rules]]\nnetwork = \"all\"\naction = \"block\"\nfrom = \"192.168.3.41\"\nto = \"internet\"\n";
+    let pf = render(&router(&host), &SecretSource::Placeholder).unwrap().get("/etc/pf.conf").unwrap().content.clone();
+    assert!(pf.contains("block drop in quick on $if_wifi inet from 192.168.3.41 to ! <internal> label \"rule:5\""), "{pf}");
+    assert!(!pf.lines().any(|l| l.contains("inet6 from 192.168.3.41")), "{pf}");
+}
+
+#[test]
+fn rules_for_one_house_tier_stay_in_it() {
+    // a lan-kind tier on the house ports: CD's rule from `internal` must not reach it
+    let text = TIERS
+        .replace(
+            "name = \"dd\"\naddress = \"192.168.2.1/24\"\nwired = true",
+            "name = \"dd\"\naddress = \"192.168.2.1/24\"\nwired = true\nkind = \"lan\"",
+        )
+        .replace("from = \"internal\"\nto = \"self\"", "from = \"net:cd\"\nto = \"self\"")
+        + "\n[[rules]]\nnetwork = \"cd\"\naction = \"pass\"\nfrom = \"internal\"\nto = \"self\"\nproto = \"tcp\"\nport = 22\n";
+    let g = render(&router(&text), &SecretSource::Placeholder).unwrap();
+    let pf = &g.get("/etc/pf.conf").unwrap().content;
+    let line = pf.lines().find(|l| l.contains("label \"rule:5\"")).unwrap();
+    assert!(line.contains("from 192.168.1.0/24 to self port 22"), "{line}");
+    // and DD's guard is above every rule on the interface
+    assert!(pf.find("label \"dd:guard\"").unwrap() < pf.find("label \"rule:1\"").unwrap());
+    // a table can't be narrowed to one tier
+    let t = text
+        .replace("from = \"internal\"\nto = \"self\"\nproto = \"tcp\"\nport = 22", "from = \"table:x\"\nto = \"self\"")
+        + "\n[[tables]]\nname = \"x\"\nentries = [\"10.0.0.0/8\"]\n";
+    assert!(check_errors(&t).iter().any(|e| e.contains("can't be its source")), "{:?}", check_errors(&t));
+}
+
+#[test]
+fn small_pf_fixes() {
+    // DHCP only to the router (no way out on udp/67 for servers)
+    let g = render(&router(EXAMPLE), &SecretSource::Placeholder).unwrap();
+    let pf = &g.get("/etc/pf.conf").unwrap().content;
+    assert!(
+        pf.contains("pass in quick on $if_servers proto udp from port bootpc to { 255.255.255.255 self } port bootps")
+    );
+    // the WAN's noise isn't logged; the router's own traffic never hits lab_block
+    assert!(pf.contains("block in on $wan label \"wan:default\""));
+    assert!(pf.contains("block out quick to <lab_block> received-on any"));
+    // `all` rules and the DoH block hold for WireGuard peers too
+    let all = format!("{EXAMPLE}\n[[rules]]\nnetwork = \"all\"\naction = \"block\"\nto = \"203.0.113.66\"\n");
+    let pf = render(&router(&all), &SecretSource::Placeholder).unwrap().get("/etc/pf.conf").unwrap().content.clone();
+    assert!(pf.contains("block drop in quick on $if_wg from any to 203.0.113.66 label \"rule:2\""), "{pf}");
+    assert!(pf.contains("label \"wg:doh\""));
+    // routed networks are inside
+    let routed = format!("{EXAMPLE}\n[[routes]]\nto = \"10.200.0.0/16\"\nvia = \"10.10.0.254\"\n");
+    let pf = render(&router(&routed), &SecretSource::Placeholder).unwrap().get("/etc/pf.conf").unwrap().content.clone();
+    assert!(pf.lines().any(|l| l.starts_with("table <internal>") && l.contains("10.200.0.0/16")));
+    // names pf uses itself, a forward past 65535, a peer policy pf has no table for
+    for bad in [
+        EXAMPLE.replace("name = \"lan\"", "name = \"wg\"").replace("network = \"lan\"", "network = \"wg\""),
+        EXAMPLE.replace("to_port = 22", "to_port = 65535").replace("port = 2222", "port = \"2222-2230\""),
+        EXAMPLE.replace("policy = \"lan\"", "policy = \"open\""),
+    ] {
+        assert!(!check_errors(&bad).is_empty());
+    }
+}
+
+#[test]
+fn protected_prefixes_parse_where_they_are_read() {
+    let text = EXAMPLE.replace("[dns]\n", "[dns]\nengine = \"octopus-dns\"\n");
+    let g = render(&router(&text), &SecretSource::Placeholder).unwrap();
+    let conf: toml::Table = g.get("/etc/octopus/pfhelper.conf").unwrap().content.parse().unwrap();
+    let list = conf["protected"].as_array().unwrap();
+    assert!(list.iter().any(|v| v.as_str() == Some("10.10.0.0/24")), "the mgmt network: {list:?}");
+    for v in list {
+        let s = v.as_str().unwrap();
+        assert!(s.parse::<ipnet::IpNet>().is_ok(), "{s} must be a prefix (ipnet)");
+    }
 }

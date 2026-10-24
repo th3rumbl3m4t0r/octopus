@@ -92,8 +92,13 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     let mut alone = vec![];
     let mut shared: Vec<(String, Vec<Value>)> = vec![];
     // per interface: one tier is a subnet; several are a shared network
-    let mut ifs: Vec<&str> = served.iter().map(|x| x.0.ifname.as_str()).collect();
-    ifs.dedup();
+    // each interface once, in file order (its tiers needn't be next to each other)
+    let mut ifs: Vec<&str> = vec![];
+    for x in &served {
+        if !ifs.contains(&x.0.ifname.as_str()) {
+            ifs.push(x.0.ifname.as_str());
+        }
+    }
     for i in &ifs {
         let here: Vec<_> = served.iter().filter(|x| x.0.ifname == *i).collect();
         if here.len() == 1 {
@@ -140,7 +145,7 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
             "client-classes": classes,
             "shared-networks": shared_networks,
             "subnet4": alone,
-            "loggers": [{"name": "kea-dhcp4", "output_options": [{"output": "syslog"}], "severity": "INFO"}],
+            "loggers": [{"name": "kea-dhcp4", "output_options": [{"output": "syslog:daemon"}], "severity": "INFO"}],
         }
     });
     let s = format!(

@@ -177,7 +177,15 @@ impl Constraints {
     }
 }
 
-/// A server certificate for `dns` names and `ips`, valid for `days`.
+/// When a certificate stops being valid (Unix seconds).
+pub fn not_after(cert_pem: &str) -> Res<i64> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).map_err(|e| format!("certificate: {e}"))?;
+    let cert = pem.parse_x509().map_err(|e| format!("certificate: {e}"))?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
+/// A server certificate for `dns` names and `ips`, valid for `days` but
+/// never past its issuer.
 pub fn issue(inter: &Ca, dns: &[String], ips: &[IpAddr], days: i64) -> Res<Leaf> {
     if dns.is_empty() && ips.is_empty() {
         return Err("a certificate needs at least one name or address".into());
@@ -200,6 +208,15 @@ pub fn issue(inter: &Ca, dns: &[String], ips: &[IpAddr], days: i64) -> Res<Leaf>
     let now = OffsetDateTime::now_utc();
     p.not_before = now - Duration::hours(1);
     p.not_after = now + Duration::days(days);
+    if let Ok(end) =
+        not_after(&inter.cert_pem).and_then(|t| OffsetDateTime::from_unix_timestamp(t).map_err(|e| e.to_string()))
+        && end < p.not_after
+    {
+        if end <= now {
+            return Err("the issuing CA has expired".into());
+        }
+        p.not_after = end;
+    }
     p.serial_number = Some(serial());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| e.to_string())?;
     let cert = p.signed_by(&key, &issuer).map_err(|e| e.to_string())?;
@@ -210,13 +227,19 @@ pub fn issue(inter: &Ca, dns: &[String], ips: &[IpAddr], days: i64) -> Res<Leaf>
     })
 }
 
-/// The interception root (design 14): pathlen 0, 2 years, no name
-/// constraints (it has to vouch for any name a server asks for). Trusted by
-/// servers only, never by personal devices.
-pub fn new_intercept_root() -> Res<Ca> {
+/// The interception root (design 14): pathlen 0, 2 years. It has to vouch
+/// for any name a server asks for, so nothing is permitted in particular;
+/// excluded are the internal zones (`excluded_dns`) and every address (its
+/// leaves only ever name hosts), so even its key can't impersonate the
+/// inside to the servers. Trusted by servers only, never by personal devices.
+pub fn new_intercept_root(excluded_dns: &[String]) -> Res<Ca> {
     let mut p = CertificateParams::default();
     p.distinguished_name = dn("Octopus interception root (servers only)");
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    let mut excluded: Vec<GeneralSubtree> = excluded_dns.iter().map(|d| GeneralSubtree::DnsName(d.clone())).collect();
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::from_addr_prefix(IpAddr::from([0u8; 4]), 0)));
+    excluded.push(GeneralSubtree::IpAddress(CidrSubnet::from_addr_prefix(IpAddr::from([0u8; 16]), 0)));
+    p.name_constraints = Some(NameConstraints { permitted_subtrees: vec![], excluded_subtrees: excluded });
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
     let now = OffsetDateTime::now_utc();
     p.not_before = now - Duration::hours(1);
@@ -268,5 +291,30 @@ mod tests {
         // constraints on DNS names only leave addresses alone
         let dns_only = Constraints { dns: vec!["home.arpa".into()], ips: vec![] };
         assert_eq!(dns_only.vouched(&[], &["192.168.1.41".parse().unwrap()]).1.len(), 1);
+    }
+
+    #[test]
+    fn leaves_end_with_their_issuer() {
+        let c = Constraints { dns: vec!["home.arpa".into()], ips: vec![] };
+        let root = new_root("r", &c).unwrap();
+        let inter = new_intermediate(&root, "i", &c).unwrap();
+        let end = not_after(&inter.cert_pem).unwrap();
+        // asked for 10 years: gets the intermediate's 3
+        let leaf = issue(&inter, &["a.home.arpa".into()], &[], 3650).unwrap();
+        assert_eq!(leaf.not_after, end);
+    }
+
+    #[test]
+    fn interception_root_excludes_the_inside() {
+        let ca = new_intercept_root(&["home.arpa".into()]).unwrap();
+        let (_, pem) = x509_parser::pem::parse_x509_pem(ca.cert_pem.as_bytes()).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        let nc = cert.name_constraints().unwrap().unwrap();
+        assert!(nc.critical);
+        let ex = nc.value.excluded_subtrees.as_ref().unwrap();
+        assert_eq!(ex.len(), 3);
+        assert!(nc.value.permitted_subtrees.is_none());
+        // and it still issues for any outside name
+        assert!(issue(&ca, &["deb.debian.org".into()], &[], 7).is_ok());
     }
 }

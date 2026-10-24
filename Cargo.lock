@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "octopus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ipnet",
  "libc",
@@ -1109,9 +1109,10 @@ dependencies = [
 
 [[package]]
 name = "octopus-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "etherparse",
+ "ipnet",
  "libc",
  "octopus-config",
  "pcre2",
@@ -1122,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-collector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -1132,9 +1133,10 @@ dependencies = [
 
 [[package]]
 name = "octopus-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ipnet",
+ "libc",
  "schemars",
  "serde",
  "toml",
@@ -1142,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-dns"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hickory-resolver",
@@ -1157,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-import-pfsense"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ipnet",
  "octopus-config",
@@ -1168,17 +1170,18 @@ dependencies = [
 
 [[package]]
 name = "octopus-pfhelper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ipnet",
  "libc",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
 name = "octopus-pki"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "ipnet",
@@ -1189,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hyper",
  "hyper-util",
@@ -1205,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ipnet",
  "octopus-config",
@@ -1217,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "octopus-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bcrypt",

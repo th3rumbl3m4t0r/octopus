@@ -94,7 +94,7 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
 
     for v in &c.vhosts {
         let outside = v.split_names(domain).1;
-        let desc = v.description.as_ref().map(|d| format!(": {}", d.replace('\n', " "))).unwrap_or_default();
+        let desc = v.description.as_ref().map(|d| format!(": {}", crate::comment(d))).unwrap_or_default();
         // (names, certificate, key, on every address)
         let mut blocks: Vec<(Vec<String>, String, String, bool)> = vec![];
         if let (Some(cert), Some(key)) = (&v.cert, &v.key) {
@@ -108,7 +108,7 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
             }
         }
         for (names, cert, key, everywhere) in blocks {
-            let _ = writeln!(s, "\n\t# {} ({}){desc}", v.name, names.join(" "));
+            let _ = writeln!(s, "\n\t# {} ({}){desc}", crate::comment(&v.name), names.join(" "));
             s += "\tserver {\n";
             s += &listen("443", " ssl");
             if everywhere {
@@ -140,7 +140,7 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
         for v in acme {
             let outside = v.split_names(domain).1;
             let (cert, key) = acme_paths(v, domain).unwrap_or_default();
-            let _ = writeln!(a, "\n# {}\ndomain {} {{", v.name, outside[0]);
+            let _ = writeln!(a, "\n# {}\ndomain {} {{", crate::comment(&v.name), outside[0]);
             if outside.len() > 1 {
                 let _ = writeln!(a, "\talternative names {{ {} }}", outside[1..].join(" "));
             }

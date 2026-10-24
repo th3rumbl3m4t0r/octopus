@@ -54,6 +54,10 @@ const PUBLIC_RESOLVERS: &str = "1.1.1.1 1.0.0.1 1.1.1.2 1.0.0.2 1.1.1.3 1.0.0.3 
     208.67.222.222 208.67.220.220 208.67.222.123 208.67.220.123 45.90.28.0/24 45.90.30.0/24 \
     185.228.168.0/24 185.228.169.0/24 194.242.2.0/24 2a07:e340::/32";
 
+/// pf state limiters: the internet's ways in, and every inside address.
+const WAN_LIMIT: &str = "wan";
+const CLIENT_LIMIT: &str = "clients";
+
 /// Default realtime ports: SSH, WireGuard and NTP are added from the config.
 const REALTIME_PORTS: &[(&str, &str, &str)] =
     &[("udp", "8801:8810", "Zoom"), ("udp", "19302:19309", "Google Meet"), ("udp", "3478:3481", "Teams / STUN")];
@@ -73,6 +77,15 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     }
     let _ = writeln!(s, "set limit {{ states {}, table-entries {} }}", c.system.max_states, c.system.max_table_entries);
     s += "set syncookies adaptive (start 25%, end 12%)\n";
+    // nobody fills the state table alone: the internet's ways in share a
+    // fifth of it, each inside address (an IPv6 /64) a tenth; management
+    // and the router's own traffic keep the rest
+    let _ = writeln!(s, "state limiter \"{WAN_LIMIT}\" id 1 limit {}", (c.system.max_states / 5).max(1000));
+    let _ = writeln!(
+        s,
+        "source limiter \"{CLIENT_LIMIT}\" id 2 entries 16384 limit {} inet6 mask 64",
+        (c.system.max_states / 10).max(1000)
+    );
     if c.logging.pflow.is_some() {
         s += "set state-defaults pflow\n";
     }
@@ -93,10 +106,8 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     s += "\n";
 
     // ---- tables
-    let mut internal: Vec<String> = r.nets.iter().map(|n| n.prefix.to_string()).collect();
-    if let Some(w) = wg {
-        internal.push(w.address.trunc().to_string());
-    }
+    // the tiers, the tunnel and the networks behind [[routes]]
+    let mut internal: Vec<String> = r.internal_v4().iter().map(|p| p.to_string()).collect();
     if v6(r) {
         // the delegated prefix is dynamic: those networks are matched via ($group:network)
         internal.push(octopus_config::model::ula_prefix(c).to_string());
@@ -144,13 +155,23 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     // ---- default deny
     s += "# ---- default deny (INV-7)\n";
     s += "block log all\n";
+    if wan.is_some() {
+        // the internet's background noise isn't logged: it would fill /var
+        // (pf is last-match, and every pass below is quick)
+        s += "block in on $wan label \"wan:default\"\n";
+    }
     if c.ipv6.mode == Ipv6Mode::Off {
         s += "block quick inet6 all\t# IPv6 is off\n";
     }
     s += "block in quick from urpf-failed label \"urpf\"\n";
     s += "block in quick from <lab_block> label \"lab_block\"\n";
-    s += "block out quick to <lab_block> label \"lab_block\"\n";
+    // forwarded traffic only: the router's own (DNS upstreams, NTP) is never cut
+    s += "block out quick to <lab_block> received-on any label \"lab_block\"\n";
     if wan.is_some() {
+        if v6(r) {
+            // the router's own DHCPv6 solicit goes to a multicast address, which <martians6> holds
+            s += "pass out quick on $wan inet6 proto udp from fe80::/10 port dhcpv6-client to ff02::1:2 port dhcpv6-server label \"v6:dhcp6\"\n";
+        }
         s += "block in quick on $wan from <martians> label \"martians\"\n";
         s += "block out quick on $wan to <martians> label \"martians\"\n";
         if v6(r) {
@@ -222,45 +243,58 @@ pub(crate) fn render(r: &Router, g: &mut Generation) {
     if let (Some(_), Some(cw)) = (wan, &c.wan) {
         s += "# ---- WAN inbound: default deny, declared paths only (INV-2)\n";
         if cw.allow_ping {
-            s += "pass in quick on $wan inet proto icmp to ($wan) icmp-type echoreq label \"wan:ping\"\n";
+            let _ = writeln!(
+                s,
+                "pass in quick on $wan inet proto icmp to ($wan) icmp-type echoreq label \"wan:ping\" state limiter \"{WAN_LIMIT}\""
+            );
             if v6(r) {
-                s += "pass in quick on $wan inet6 proto icmp6 to self icmp6-type echoreq label \"wan:ping\"\n";
+                let _ = writeln!(
+                    s,
+                    "pass in quick on $wan inet6 proto icmp6 to self icmp6-type echoreq label \"wan:ping\" state limiter \"{WAN_LIMIT}\""
+                );
             }
         }
         // [[rules]] on the wan: blocks only (INV-2), ahead of every way in
         for (k, rule) in c.rules.iter().enumerate().filter(|(_, x)| x.network == RULE_WAN) {
-            let _ = writeln!(s, "{}", explicit_rule(r, "$wan", k, rule));
+            s += &explicit_rule(r, "$wan", k, rule, None);
         }
         if let Some(w) = wg {
-            let _ =
-                writeln!(s, "pass in quick on $wan proto udp to ($wan) port {} label \"wan:wireguard\"", w.listen_port);
+            let _ = writeln!(
+                s,
+                "pass in quick on $wan proto udp to ($wan) port {} label \"wan:wireguard\" state limiter \"{WAN_LIMIT}\"",
+                w.listen_port
+            );
         }
         if let Some(from) = public_vhost_sources(r) {
             let _ = writeln!(
                 s,
-                "pass in quick on $wan proto tcp from {from} to ($wan) port {{ http https }} label \"wan:vhosts\""
+                "pass in quick on $wan proto tcp from {from} to ($wan) port {{ http https }} label \"wan:vhosts\" state limiter \"{WAN_LIMIT}\""
             );
         }
         for f in &c.forwards {
             let _ = writeln!(
                 s,
-                "pass in{} quick on $wan inet{} from {} to ($wan){} rdr-to {}{} label \"fwd:{}\"",
+                "pass in{} quick on $wan inet{} from {} to ($wan){} rdr-to {}{} label \"fwd:{}\" state limiter \"{WAN_LIMIT}\"",
                 if f.log { " log" } else { "" },
                 proto(f.proto),
                 endpoint_str(r, &r.endpoint(&f.from).unwrap_or(Endpoint::Any)),
                 port_clause(&f.port),
                 f.to,
                 f.to_port.map(|p| format!(" port {p}")).unwrap_or_default(),
-                f.name
+                label(&f.name)
             );
         }
         s += "\n";
     }
 
-    // ---- internal networks
-    let mut all_done = std::collections::BTreeSet::new();
+    // ---- internal networks: one section per interface (tiers on the house
+    // ports share one)
+    let mut done = std::collections::BTreeSet::new();
     for n in &r.nets {
-        render_network(&mut s, r, n, &mut all_done);
+        if done.insert(n.ifname.clone()) {
+            let here: Vec<&Net> = r.nets.iter().filter(|x| x.ifname == n.ifname).collect();
+            render_interface(&mut s, r, &here);
+        }
     }
     if let Some(w) = wg {
         render_wg(&mut s, r, w);
@@ -283,72 +317,117 @@ fn src_clause(n: &Net) -> String {
     n.src.map(|p| format!(" from {p}")).unwrap_or_default()
 }
 
-fn render_network(s: &mut String, r: &Router, n: &Net, all_done: &mut std::collections::BTreeSet<String>) {
+/// The tiers on one interface, in this order: every tier's management guard
+/// (fixed kinds) and DoT/DoH blocks, so no rule for one tier comes before
+/// another tier's guard; then the explicit rules in file order; links;
+/// reflection; each tier's kind policy; the IPv6 of a shared interface.
+fn render_interface(s: &mut String, r: &Router, here: &[&Net]) {
     let c = &r.cfg;
-    let _ = writeln!(s, "# ---- {} ({}, {}, {})", n.name, n.kind, n.ifname, n.prefix);
-    let i = format!("$if_{}", n.name);
-    let src = src_clause(n);
-
-    reflection(s, r, &i);
-    // open tiers: the guard comes after the rules, which may let them in
-    if !matches!(n.kind, Kind::Mgmt | Kind::Open) {
-        let _ = writeln!(
-            s,
-            "block in log quick on {i} proto tcp{src} to self port $mgmt_ports label \"{}:guard\"\t# INV-1",
-            n.name
-        );
+    let first = here[0];
+    let i = format!("$if_{}", first.name);
+    for n in here {
+        let _ = writeln!(s, "# ---- {} ({}, {}, {})", n.name, n.kind, n.ifname, n.prefix);
     }
-    let _ = writeln!(
-        s,
-        "block in log quick on {i} proto {{ tcp udp }}{src} to ! self port 853 label \"{}:dot\"\t# INV-4",
-        n.name
-    );
-    if c.dns.block_public_resolvers {
-        let _ = writeln!(
-            s,
-            "block in log quick on {i} proto {{ tcp udp }}{src} to <public_resolvers> port {{ 443 853 }} label \"{}:doh\"\t# INV-4",
-            n.name
-        );
-    }
-
-    // rules on every network: once per interface (they match by source)
-    let first_here = all_done.insert(n.ifname.clone());
-    for (k, rule) in
-        c.rules.iter().enumerate().filter(|(_, x)| x.network == n.name || (x.network == RULE_ALL && first_here))
-    {
-        let mut line = explicit_rule(r, &i, k, rule);
-        if rule.network == n.name && rule.from == "any" && !src.is_empty() {
-            line = line.replacen(" from any ", &format!("{src} "), 1);
+    for n in here {
+        let i = format!("$if_{}", n.name);
+        let src = src_clause(n);
+        // open tiers: the guard comes after the rules, which may let them in
+        if !matches!(n.kind, Kind::Mgmt | Kind::Open) {
+            let _ = writeln!(
+                s,
+                "block in log quick on {i} proto tcp{src} to self port $mgmt_ports label \"{}:guard\"\t# INV-1",
+                n.name
+            );
         }
-        let _ = writeln!(s, "{line}");
+        let _ = writeln!(
+            s,
+            "block in log quick on {i} proto {{ tcp udp }}{src} to ! self port 853 label \"{}:dot\"\t# INV-4",
+            n.name
+        );
+        if c.dns.block_public_resolvers {
+            let _ = writeln!(
+                s,
+                "block in log quick on {i} proto {{ tcp udp }}{src} to <public_resolvers> port {{ 443 853 }} label \"{}:doh\"\t# INV-4",
+                n.name
+            );
+        }
     }
-    if n.kind == Kind::Servers {
+    let owner = r.v6_owner(&first.ifname);
+    if let Some(o) = owner {
+        // the shared /64: the same blocks without a source (IPv4 ranges don't cover it)
+        if !matches!(o.kind, Kind::Mgmt | Kind::Open) {
+            let _ = writeln!(
+                s,
+                "block in log quick on {i} inet6 proto tcp to self port $mgmt_ports label \"{}:guard\"\t# INV-1",
+                o.name
+            );
+        }
+        let _ = writeln!(
+            s,
+            "block in log quick on {i} inet6 proto {{ tcp udp }} to ! self port 853 label \"{}:dot\"\t# INV-4",
+            o.name
+        );
+        if c.dns.block_public_resolvers {
+            let _ = writeln!(
+                s,
+                "block in log quick on {i} inet6 proto {{ tcp udp }} to <public_resolvers> port {{ 443 853 }} label \"{}:doh\"\t# INV-4",
+                o.name
+            );
+        }
+    }
+
+    // explicit rules in file order: the `all` ones once per interface (they
+    // match by source); one tier's rules on a shared interface only from its range
+    for (k, rule) in c.rules.iter().enumerate() {
+        if rule.network == RULE_ALL {
+            *s += &explicit_rule(r, &i, k, rule, None);
+        } else if let Some(n) = here.iter().find(|n| n.name == rule.network) {
+            let scope = (here.len() > 1).then_some(*n);
+            *s += &explicit_rule(r, &format!("$if_{}", n.name), k, rule, scope);
+        }
+    }
+    for n in here.iter().filter(|n| n.kind == Kind::Servers) {
         for (k, l) in c.links.iter().enumerate().filter(|(_, x)| x.network == n.name) {
             if let Ok(to) = r.endpoint(&l.to) {
                 let _ = writeln!(
                     s,
-                    "pass in quick on {i}{} to {}{} label \"link:{}\"{}",
-                    proto(l.proto),
+                    "pass in quick on $if_{}{}{} to {}{} label \"link:{}\"{}{}",
+                    n.name,
+                    if l.proto == Proto::Icmp { " inet proto icmp" } else { proto(l.proto) },
+                    src_clause(n),
                     endpoint_str(r, &to),
                     l.port.as_ref().map(port_clause).unwrap_or_default(),
                     k + 1,
+                    limiter(n.kind),
                     l.description.as_ref().map(|d| format!("\t# {}", one_line(d))).unwrap_or_default()
                 );
             }
         }
     }
-    let from = n.src.map(|p| p.to_string());
-    kind_policy(s, r, &i, &n.name, n.kind, &router_addrs(n), from.as_deref());
-    if n.kind == Kind::Open && n.src.is_some() && n.v6.is_some() {
-        // IPv6 on a shared interface: one /64 for its tiers, the same policy
+    // after the rules: an explicit block inside also stops the way round through the WAN address
+    reflection(s, r, &i);
+    for n in here {
+        let from = n.src.map(|p| p.to_string());
+        kind_policy(s, r, &format!("$if_{}", n.name), &n.name, n.kind, &router_addrs(n), from.as_deref());
+    }
+    if let Some(o) = owner
+        && o.kind == Kind::Open
+    {
+        // IPv6 on a shared interface: one /64 for its tiers, the policy of its owner
         let _ = writeln!(
             s,
             "block in log quick on {i} inet6 proto tcp to self port $mgmt_ports label \"{}:guard\"",
-            n.name
+            o.name
         );
-        let _ = writeln!(s, "pass in quick on {i} inet6 label \"{}:open\"", n.name);
+        let _ = writeln!(s, "pass in quick on {i} inet6 label \"{}:open\"{}", o.name, limiter(o.kind));
     }
     s.push('\n');
+}
+
+/// The per-address limiter on a pass rule (not for management: the way in
+/// must stay open).
+fn limiter(kind: Kind) -> String {
+    if kind == Kind::Mgmt { String::new() } else { format!(" source limiter \"{CLIENT_LIMIT}\"") }
 }
 
 /// Router services and the default for a kind. `from` narrows the source
@@ -363,12 +442,12 @@ fn kind_policy(s: &mut String, r: &Router, i: &str, label: &str, kind: Kind, add
                 s,
                 "block in log quick on {i} proto tcp{src} to self port $mgmt_ports label \"{label}:guard\"\t# INV-1"
             );
-            let _ = writeln!(s, "pass in quick on {i}{src} label \"{label}:open\"");
+            let _ = writeln!(s, "pass in quick on {i}{src} label \"{label}:open\"{}", limiter(kind));
             if from.is_some() {
                 // DHCP comes from 0.0.0.0, not the tier's addresses
                 let _ = writeln!(
                     s,
-                    "pass in quick on {i} proto udp from port bootpc to port bootps label \"{label}:dhcp\""
+                    "pass in quick on {i} proto udp from port bootpc to {{ 255.255.255.255 self }} port bootps label \"{label}:dhcp\""
                 );
             }
         }
@@ -376,23 +455,26 @@ fn kind_policy(s: &mut String, r: &Router, i: &str, label: &str, kind: Kind, add
             let _ = writeln!(s, "pass in quick on {i}{src} label \"{label}:mgmt\"");
         }
         Kind::Lan | Kind::Servers | Kind::Guest => {
+            let lim = limiter(kind);
             let _ = writeln!(
                 s,
-                "pass in quick on {i} proto {{ tcp udp }}{src} to {addr} port domain label \"{label}:dns\""
+                "pass in quick on {i} proto {{ tcp udp }}{src} to {addr} port domain label \"{label}:dns\"{lim}"
             );
             if from.is_none() {
+                // to the router: never a way out (INV-3) or to other hosts' port 67
                 let _ = writeln!(
                     s,
-                    "pass in quick on {i} proto udp from port bootpc to port bootps label \"{label}:dhcp\""
+                    "pass in quick on {i} proto udp from port bootpc to {{ 255.255.255.255 self }} port bootps label \"{label}:dhcp\""
                 );
             }
             if r.cfg.ntp.serve {
-                let _ = writeln!(s, "pass in quick on {i} proto udp{src} to {addr} port ntp label \"{label}:ntp\"");
+                let _ =
+                    writeln!(s, "pass in quick on {i} proto udp{src} to {addr} port ntp label \"{label}:ntp\"{lim}");
             }
             if kind == Kind::Lan && !r.cfg.vhosts.is_empty() {
                 let _ = writeln!(
                     s,
-                    "pass in quick on {i} proto tcp{src} to self port {{ http https }} label \"{label}:vhosts\""
+                    "pass in quick on {i} proto tcp{src} to self port {{ http https }} label \"{label}:vhosts\"{lim}"
                 );
             }
             let v4addr = addr.trim_matches(['{', '}', ' ']).split(' ').next().unwrap_or(addr);
@@ -415,7 +497,7 @@ fn kind_policy(s: &mut String, r: &Router, i: &str, label: &str, kind: Kind, add
                         "block in log quick on {i} inet6 to ({LAN_GROUP}:network) label \"{label}:internal6\""
                     );
                 }
-                let _ = writeln!(s, "pass in quick on {i}{src} to ! <internal> label \"{label}:internet\"");
+                let _ = writeln!(s, "pass in quick on {i}{src} to ! <internal> label \"{label}:internet\"{lim}");
             } else if from.is_none() {
                 // web traffic goes to octopus-proxy on loopback (allowlist, verified TLS); the
                 // rest only through [[links]] (INV-3)
@@ -426,11 +508,11 @@ fn kind_policy(s: &mut String, r: &Router, i: &str, label: &str, kind: Kind, add
                     let (https, http) = crate::proxy::ports(idx);
                     let _ = writeln!(
                         s,
-                        "pass in quick on {i} proto tcp to ! <internal> port https divert-to 127.0.0.1 port {https} label \"{label}:proxy\""
+                        "pass in quick on {i} proto tcp to ! <internal> port https divert-to 127.0.0.1 port {https} label \"{label}:proxy\"{lim}"
                     );
                     let _ = writeln!(
                         s,
-                        "pass in quick on {i} proto tcp to ! <internal> port http divert-to 127.0.0.1 port {http} label \"{label}:proxy\""
+                        "pass in quick on {i} proto tcp to ! <internal> port http divert-to 127.0.0.1 port {http} label \"{label}:proxy\"{lim}"
                     );
                 } else {
                     let _ =
@@ -444,14 +526,24 @@ fn kind_policy(s: &mut String, r: &Router, i: &str, label: &str, kind: Kind, add
 fn render_wg(s: &mut String, r: &Router, w: &WireGuard) {
     let _ = writeln!(s, "# ---- wireguard ({WG_IF}, {})", w.address.trunc());
     let addr = w.address.addr().to_string();
-    reflection(s, r, "$if_wg");
     let _ = writeln!(
         s,
         "block in log quick on $if_wg proto tcp from ! <wg_mgmt> to self port $mgmt_ports label \"wg:guard\"\t# INV-1"
     );
     let _ =
         writeln!(s, "block in log quick on $if_wg proto {{ tcp udp }} to ! self port 853 label \"wg:dot\"\t# INV-4");
+    if r.cfg.dns.block_public_resolvers {
+        let _ = writeln!(
+            s,
+            "block in log quick on $if_wg proto {{ tcp udp }} to <public_resolvers> port {{ 443 853 }} label \"wg:doh\"\t# INV-4"
+        );
+    }
+    // rules on every internal network hold for the peers too
+    for (k, rule) in r.cfg.rules.iter().enumerate().filter(|(_, x)| x.network == RULE_ALL) {
+        *s += &explicit_rule(r, "$if_wg", k, rule, None);
+    }
     kind_policy(s, r, "$if_wg", "wg_mgmt", Kind::Mgmt, &addr, Some("<wg_mgmt>"));
+    reflection(s, r, "$if_wg");
     kind_policy(s, r, "$if_wg", "wg_lan", Kind::Lan, &addr, Some("<wg_lan>"));
     s.push('\n');
 }
@@ -470,17 +562,20 @@ fn reflection(s: &mut String, r: &Router, i: &str) {
         };
         let _ = writeln!(
             s,
-            "pass in quick on {i} inet{} from {from} to ($wan){} rdr-to {}{} tag RFL_{k} label \"fwd:{}:reflect\"",
+            "pass in quick on {i} inet{} from {from} to ($wan){} rdr-to {}{} tag RFL_{k} label \"fwd:{}:reflect\" source limiter \"{CLIENT_LIMIT}\"",
             proto(f.proto),
             port_clause(&f.port),
             f.to,
             f.to_port.map(|p| format!(" port {p}")).unwrap_or_default(),
-            f.name
+            label(&f.name)
         );
     }
 }
 
-fn explicit_rule(r: &Router, i: &str, k: usize, rule: &Rule) -> String {
+/// An explicit [[rules]] entry: one pf line per address family it needs
+/// (see `alternatives`). `scope`: the tier the rule is for when its
+/// interface carries other tiers too; the source is narrowed to its range.
+fn explicit_rule(r: &Router, i: &str, k: usize, rule: &Rule, scope: Option<&Net>) -> String {
     let action = match rule.action {
         Action::Pass => "pass",
         Action::Block => "block drop",
@@ -488,21 +583,121 @@ fn explicit_rule(r: &Router, i: &str, k: usize, rule: &Rule) -> String {
     };
     let from = r.endpoint(&rule.from).unwrap_or(Endpoint::Any);
     let to = r.endpoint(&rule.to).unwrap_or(Endpoint::Any);
+    let froms = match scope {
+        Some(n) => narrow(r, &from, n),
+        None => alternatives(r, &from),
+    };
     // on the WAN pf sees the WAN address: forwards translate after this rule
-    let to = if rule.network == RULE_WAN && r.is_internal(&to) { "($wan)".to_string() } else { endpoint_str(r, &to) };
-    let mut line = format!(
-        "{action} in{} quick on {i}{} from {} to {}{} label \"rule:{}\"",
-        if rule.log { " log" } else { "" },
-        proto(rule.proto),
-        endpoint_str(r, &from),
-        to,
-        rule.port.as_ref().map(port_clause).unwrap_or_default(),
-        k + 1
-    );
-    if let Some(d) = &rule.description {
-        let _ = write!(line, "\t# {}", one_line(d));
+    let tos = if rule.network == RULE_WAN && r.is_internal(&to) {
+        vec![(Af::Any, "($wan)".to_string())]
+    } else {
+        alternatives(r, &to)
+    };
+    let icmp = rule.proto == Proto::Icmp;
+    let lim = if rule.action == Action::Pass && rule.network != RULE_WAN { limiter(Kind::Open) } else { String::new() };
+    let desc = rule.description.as_ref().map(|d| format!("\t# {}", one_line(d))).unwrap_or_default();
+    let mut out = String::new();
+    for (fa, f) in &froms {
+        for (ta, t) in &tos {
+            // ICMP is IPv4 only: a network that also has IPv6 would expand to both
+            let Some(af) = fa.with(*ta).and_then(|a| if icmp { a.with(Af::Inet) } else { Some(a) }) else { continue };
+            let _ = writeln!(
+                out,
+                "{action} in{} quick on {i}{}{} from {f} to {t}{} label \"rule:{}\"{lim}{desc}",
+                if rule.log { " log" } else { "" },
+                af.keyword(),
+                proto(rule.proto),
+                rule.port.as_ref().map(port_clause).unwrap_or_default(),
+                k + 1,
+            );
+        }
     }
-    line
+    if out.is_empty() {
+        let _ = writeln!(out, "# rule:{} can't match on {i}{desc}", k + 1);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Af {
+    Any,
+    Inet,
+    Inet6,
+}
+
+impl Af {
+    /// Both at once, if they can be.
+    fn with(self, o: Af) -> Option<Af> {
+        match (self, o) {
+            (Af::Any, x) | (x, Af::Any) => Some(x),
+            (a, b) if a == b => Some(a),
+            _ => None,
+        }
+    }
+
+    fn keyword(self) -> &'static str {
+        match self {
+            Af::Any => "",
+            Af::Inet => " inet",
+            Af::Inet6 => " inet6",
+        }
+    }
+}
+
+/// An endpoint as pf alternatives, one rule each. IPv6 needs its own: the
+/// delegated prefixes are dynamic (pf tracks them through the interface
+/// group), pf can't negate a list, and a shared interface's `:network`
+/// would cover every tier aliased on it.
+fn alternatives(r: &Router, e: &Endpoint) -> Vec<(Af, String)> {
+    match e {
+        Endpoint::Internal if v6(r) => {
+            vec![(Af::Any, "<internal>".into()), (Af::Inet6, format!("({LAN_GROUP}:network)"))]
+        }
+        Endpoint::Internet if v6(r) => {
+            vec![(Af::Inet, "! <internal>".into()), (Af::Inet6, format!("! ({LAN_GROUP}:network)"))]
+        }
+        Endpoint::Net(i) => net_alternatives(r, &r.nets[*i]),
+        // an address is of one family: never paired with the other's alternative
+        Endpoint::Addr(a @ IpNet::V4(_)) if v6(r) => vec![(Af::Inet, host_or_net(*a))],
+        Endpoint::Addr(a @ IpNet::V6(_)) if v6(r) => vec![(Af::Inet6, host_or_net(*a))],
+        _ => vec![(Af::Any, endpoint_str(r, e))],
+    }
+}
+
+/// A tier: alone on its interface, the interface's networks (its delegated
+/// /64 included); sharing one, its IPv4 range, and the interface's /64 if it
+/// is the tier that owns it.
+fn net_alternatives(r: &Router, n: &Net) -> Vec<(Af, String)> {
+    match n.src {
+        None if n.v6.is_some() => vec![(Af::Any, format!("($if_{}:network)", n.name))],
+        None => vec![(Af::Any, n.prefix.to_string())],
+        Some(p) => {
+            let mut v = vec![(Af::Inet, p.to_string())];
+            if r.v6_owner(&n.ifname).is_some_and(|o| o.name == n.name) {
+                v.push((Af::Inet6, format!("($if_{}:network)", n.name)));
+            }
+            v
+        }
+    }
+}
+
+/// A rule's source narrowed to tier `n`, which shares its interface: the
+/// part of it that can come from the tier.
+fn narrow(r: &Router, from: &Endpoint, n: &Net) -> Vec<(Af, String)> {
+    let own = net_alternatives(r, n);
+    let p = n.src.unwrap_or(n.prefix);
+    match from {
+        Endpoint::Any | Endpoint::Internal => own,
+        Endpoint::Net(j) if r.nets[*j].name == n.name => own,
+        Endpoint::Addr(IpNet::V4(a)) if p.contains(a) => vec![(Af::Inet, host_or_net(IpNet::V4(*a)))],
+        Endpoint::Addr(IpNet::V4(a)) if a.contains(&p) => vec![(Af::Inet, p.to_string())],
+        Endpoint::Addr(IpNet::V6(a)) if own.iter().any(|(af, _)| *af == Af::Inet6) => {
+            vec![(Af::Inet6, host_or_net(IpNet::V6(*a)))]
+        }
+        // a table can't be narrowed (check refuses it); anything else is never from here
+        Endpoint::Table(_) => vec![(Af::Any, endpoint_str(r, from))],
+        _ => vec![],
+    }
 }
 
 /// Who may reach the public vhosts on the WAN (None: no public vhost). One
@@ -538,8 +733,11 @@ fn endpoint_str(r: &Router, e: &Endpoint) -> String {
         Endpoint::Router => "self".into(),
         Endpoint::Internal => "<internal>".into(),
         Endpoint::Internet => "! <internal>".into(),
-        // with IPv6 the network's delegated prefix is dynamic: let pf track the interface
-        Endpoint::Net(i) if r.nets[*i].v6.is_some() => format!("($if_{}:network)", r.nets[*i].name),
+        // with IPv6 the network's delegated prefix is dynamic: let pf track the
+        // interface, unless other tiers share it (their aliases would count)
+        Endpoint::Net(i) if r.nets[*i].v6.is_some() && r.nets[*i].src.is_none() => {
+            format!("($if_{}:network)", r.nets[*i].name)
+        }
         Endpoint::Net(i) => r.nets[*i].prefix.to_string(),
         Endpoint::Addr(a) => host_or_net(*a),
         Endpoint::Table(t) => format!("<t_{t}>"),
@@ -556,8 +754,8 @@ fn proto(p: Proto) -> &'static str {
         Proto::Tcp => " proto tcp",
         Proto::Udp => " proto udp",
         Proto::TcpUdp => " proto { tcp udp }",
-        // ICMP is IPv4 only: a network that also has IPv6 would expand to both
-        Proto::Icmp => " inet proto icmp",
+        // ICMP is IPv4 only (explicit rules say inet themselves)
+        Proto::Icmp => " proto icmp",
         Proto::Gre => " proto gre",
         Proto::Esp => " proto esp",
     }
@@ -575,13 +773,18 @@ fn port_clause(p: &Ports) -> String {
 /// Port(s) a forward lands on internally.
 fn target_port(f: &Forward) -> Ports {
     match (f.to_port, f.port.0.as_slice()) {
-        (Some(tp), [(a, b)]) => Ports(vec![(tp, tp + (b - a))]),
+        (Some(tp), [(a, b)]) => Ports(vec![(tp, tp.saturating_add(b - a))]),
         _ => f.port.clone(),
     }
 }
 
 fn one_line(s: &str) -> String {
-    s.replace(['\n', '\r'], " ")
+    crate::comment(s)
+}
+
+/// Text inside a `label "..."`: names are checked, this is the second line of defence.
+fn label(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')).collect()
 }
 
 /// Long tables wrapped over several lines.
@@ -721,9 +924,12 @@ fn render_classification(s: &mut String, r: &Router, t: &Traffic, nets: &[&Net],
         return;
     }
     s.push_str("match out on $wan set queue (up_def, up_rt)\n");
+    // who first, then where: the destination class wins (last match), as on the way down
+    for cl in Class::ALL.into_iter().filter(|c| *c != Class::Default) {
+        let _ = writeln!(s, "match out on $wan tagged C_{} set queue {}", short(cl), upq(cl));
+    }
     for cl in Class::ALL {
         if cl != Class::Default {
-            let _ = writeln!(s, "match out on $wan tagged C_{} set queue {}", short(cl), upq(cl));
             let _ = writeln!(s, "match out on $wan to <cls_{}> set queue {}", cl.name(), upq(cl));
         }
         for (p, ps, _) in ports.iter().filter(|x| x.2 == cl) {

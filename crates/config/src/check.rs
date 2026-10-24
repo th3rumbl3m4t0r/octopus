@@ -12,13 +12,100 @@ use crate::model::{Endpoint, RULE_ALL, RULE_WAN, Router};
 use crate::schema::*;
 use crate::secrets::{self, Secrets};
 
-const RESERVED: [&str; 9] = ["any", "self", "wan", "all", "egress", "lo", "internal", "internet", "cloudflare"];
+/// Where anyone can get a name of their own (buckets, pages, apps).
+const SHARED_SUFFIXES: &[&str] = &[
+    "amazonaws.com",
+    "cloudfront.net",
+    "github.io",
+    "githubusercontent.com",
+    "gitlab.io",
+    "blob.core.windows.net",
+    "azurewebsites.net",
+    "azureedge.net",
+    "herokuapp.com",
+    "appspot.com",
+    "googleusercontent.com",
+    "storage.googleapis.com",
+    "firebaseapp.com",
+    "web.app",
+    "netlify.app",
+    "vercel.app",
+    "pages.dev",
+    "workers.dev",
+    "r2.dev",
+    "fastly.net",
+    "digitaloceanspaces.com",
+    "backblazeb2.com",
+    "ngrok.io",
+    "ngrok-free.app",
+];
+
+/// Words with a meaning of their own in router.toml, or in pf.conf as macro
+/// (`$if_wg`) and label (`wg_lan:`, `rule:`) names.
+const RESERVED: [&str; 19] = [
+    "any",
+    "self",
+    "wan",
+    "all",
+    "egress",
+    "lo",
+    "internal",
+    "internet",
+    "cloudflare",
+    "wg",
+    "wg_mgmt",
+    "wg_lan",
+    "v6",
+    "rule",
+    "link",
+    "fwd",
+    "urpf",
+    "lab_block",
+    "martians",
+];
 
 fn ident_ok(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
         && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A name that ends up in labels and comments of generated files: a-z, 0-9,
+/// `_` and `-`, starting with a letter or digit.
+fn name_ok(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// An absolute path of plain characters: nothing a shell, rc.conf.local or
+/// a daemon's config parser would read as syntax, and no `..`.
+pub fn path_ok(s: &str) -> bool {
+    s.starts_with('/')
+        && s.len() <= 255
+        && !s.split('/').any(|p| p == "..")
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+}
+
+/// A WireGuard key: 32 bytes in base64, 43 characters and `=` (the last
+/// character carries 4 bits, so only every fourth letter can end it).
+pub fn wg_key_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 44
+        && b[43] == b'='
+        && b[..43].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/'))
+        && b"AEIMQUYcgkosw048".contains(&b[42])
+}
+
+/// A host name or an address (IPv6 in brackets where a port may follow).
+pub fn host_ok(s: &str) -> bool {
+    let bare = s.strip_prefix('[').and_then(|x| x.strip_suffix(']'));
+    match bare {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => s.parse::<Ipv4Addr>().is_ok() || (dns_name_ok(s) && !s.is_empty()),
+    }
 }
 
 pub fn dns_label_ok(s: &str) -> bool {
@@ -43,7 +130,8 @@ pub fn parse_rate(s: &str) -> Option<u64> {
         'G' => (&s[..s.len() - 1], 1_000_000_000),
         _ => (s, 1),
     };
-    num.parse::<u64>().ok().filter(|n| *n > 0).map(|n| n * mult)
+    // at most 100G: anything more is a typo, and the queue math stays in range
+    num.parse::<u64>().ok().filter(|n| *n > 0).and_then(|n| n.checked_mul(mult)).filter(|b| *b <= 100_000_000_000)
 }
 
 /// Remote syslog target: (proto, host, port).
@@ -56,12 +144,51 @@ pub fn parse_remote(s: &str) -> Option<(&str, &str, Option<u16>)> {
         Some((h, p)) if !h.contains(':') || h.starts_with('[') => (h, Some(p.parse().ok()?)),
         _ => (rest, None),
     };
-    (!host.is_empty()).then_some((proto, host, port))
+    // it becomes a syslog.conf action: a host and nothing else
+    host_ok(host).then_some((proto, host, port))
+}
+
+/// An ntpd `constraints from` URL: https://, a host, an optional plain path.
+pub fn constraint_ok(s: &str) -> bool {
+    let rest = s.strip_prefix("https://").unwrap_or(s);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    host_ok(host) && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~'))
+}
+
+/// Every string in the file, with where it is: control characters (a
+/// newline above all) would start a new line in some generated file.
+fn control_chars(c: &Config, d: &mut Diagnostics) {
+    fn walk(v: &toml::Value, path: &str, d: &mut Diagnostics) {
+        match v {
+            toml::Value::String(s) if s.chars().any(char::is_control) => {
+                d.error("E-TEXT", format!("{path}: no control characters (newlines, tabs, ...) in values"))
+            }
+            toml::Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    walk(x, &format!("{path}[{i}]"), d);
+                }
+            }
+            toml::Value::Table(t) => {
+                for (k, x) in t {
+                    if k.chars().any(char::is_control) {
+                        d.error("E-TEXT", format!("{path}: a key with control characters"));
+                    }
+                    walk(x, &if path.is_empty() { k.clone() } else { format!("{path}.{k}") }, d);
+                }
+            }
+            _ => {}
+        }
+    }
+    match toml::Value::try_from(c) {
+        Ok(v) => walk(&v, "", d),
+        Err(e) => d.error("E-TEXT", format!("can't re-read the configuration: {e}")),
+    }
 }
 
 pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     let mut d = Diagnostics::default();
     let c = &r.cfg;
+    control_chars(c, &mut d);
 
     // ---- system
     if !dns_label_ok(&c.system.hostname) {
@@ -82,6 +209,19 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     // ---- interfaces: one role per MAC
     let mut macs = BTreeMap::new();
     for (role, i) in &c.interfaces {
+        if !name_ok(role, 31) {
+            d.error("E-IF", format!("interface role {role:?}: use a-z, 0-9, _, - (max 31)"));
+        }
+        if let Some(n) = &i.name {
+            let digits = n.trim_start_matches(|ch: char| ch.is_ascii_lowercase());
+            if n.len() > 15
+                || digits.len() == n.len()
+                || digits.is_empty()
+                || !digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                d.error("E-IF", format!("interface {role}: name {n:?} is not an interface name like igc0"));
+            }
+        }
         if let Some(m) = normalize_mac(&i.mac)
             && let Some(other) = macs.insert(m.clone(), role)
         {
@@ -111,7 +251,7 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             d.error("E-WAN", format!("wan.mtu {} out of range", w.mtu));
         }
         if let Some(m) = w.mss
-            && m + 40 > w.mtu
+            && u32::from(m) + 40 > u32::from(w.mtu)
         {
             d.error("E-WAN", format!("wan.mss {m} doesn't fit mtu {}", w.mtu));
         }
@@ -120,7 +260,7 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         }
         if let Some(WanMode::Pppoe { user, password, auth }) = &w.mode() {
             for s in [user, password] {
-                check_secret_ref(&mut d, "wan.pppoe", s, secrets);
+                check_router_secret(&mut d, "wan.pppoe", s, secrets);
             }
             if !matches!(auth.as_str(), "chap" | "pap") {
                 d.error("E-WAN", "wan.auth must be chap or pap");
@@ -205,6 +345,15 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if lan.ports.is_empty() {
             d.error("E-LAN", "lan: no ports");
         }
+        for n in c.networks.iter().filter(|n| n.vlan.is_none() && n.bridge.iter().any(|p| lan.ports.contains(p))) {
+            d.error(
+                "E-LAN",
+                format!(
+                    "tier {}: bridge uses house ports ([lan]); two untagged networks on one wire would share it: leave bridge out to put the tier there",
+                    n.name
+                ),
+            );
+        }
         for n in c.networks.iter().filter(|n| n.interface.as_ref().is_some_and(|i| lan.ports.contains(i))) {
             d.error(
                 "E-LAN",
@@ -226,6 +375,33 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     if untagged.len() > 1 && !untagged.iter().any(|n| n.wired) {
         d.warn("E-LAN", "no tier is wired = true: a device on a cable whose MAC no tier lists gets no address");
     }
+    for n in &c.networks {
+        if !n.ports.is_empty() {
+            let lan_ports = c.lan.as_ref().map(|l| l.ports.as_slice()).unwrap_or_default();
+            if !on_lan(n) || n.vlan.is_none() {
+                d.error(
+                    "E-LAN",
+                    format!("tier {}: ports picks the house ports that carry a VLAN tier ([lan], vlan)", n.name),
+                );
+            }
+            for p in n.ports.iter().filter(|p| !lan_ports.contains(p)) {
+                d.error("E-LAN", format!("tier {}: {p} is not a house port ([lan] ports)", n.name));
+            }
+        } else if on_lan(n)
+            && n.vlan.is_some()
+            && !r.is_guest(&n.name)
+            && c.lan.as_ref().is_some_and(|l| l.ports.len() > 1)
+        {
+            d.warn(
+                "E-LAN",
+                format!(
+                    "tier {}: VLAN {} is carried on every house port, so any device on a cable can join it by tagging; set ports to the access points' ports",
+                    n.name,
+                    n.vlan.unwrap_or(0)
+                ),
+            );
+        }
+    }
     let mut seen_macs: BTreeMap<String, &str> = BTreeMap::new();
     for n in &c.networks {
         if (!n.macs.is_empty() || n.wired) && !(on_lan(n) && n.vlan.is_none()) {
@@ -239,6 +415,18 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         }
         if n.kind == Kind::Open && c.lan.is_none() && n.interface.is_none() && n.bridge.is_empty() {
             d.error("E-LAN", format!("tier {}: no interface or bridge, and no [lan]", n.name));
+        }
+        let prefixes: Vec<&str> = n.macs.iter().filter(|m| m.split(':').count() < 6).map(String::as_str).collect();
+        if !prefixes.is_empty() {
+            d.warn(
+                "E-LAN",
+                format!(
+                    "tier {}: {} {} a prefix: any device that sets such a MAC is placed there and passes the guard",
+                    n.name,
+                    prefixes.join(", "),
+                    if prefixes.len() == 1 { "is" } else { "are" }
+                ),
+            );
         }
         for m in &n.macs {
             let ok = !m.is_empty()
@@ -360,6 +548,9 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     // ---- forwards (INV-2: the only declared inbound paths)
     let mut fnames = BTreeSet::new();
     for f in &c.forwards {
+        if !name_ok(&f.name, 31) {
+            d.error("E-FWD", format!("forward {:?}: a name of a-z, 0-9, _, - (max 31)", f.name));
+        }
         if !fnames.insert(&f.name) {
             d.error("E-FWD", format!("duplicate forward {}", f.name));
         }
@@ -374,6 +565,14 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if f.to_port.is_some() && f.port.0.len() != 1 {
             // a range maps onto a range starting at to_port; a list can't
             d.error("E-FWD", format!("forward {}: to_port needs a single port or range", f.name));
+        }
+        if let (Some(tp), [(a, b)]) = (f.to_port, f.port.0.as_slice())
+            && u32::from(tp) + u32::from(b - a) > 65535
+        {
+            d.error(
+                "E-FWD",
+                format!("forward {}: to_port {tp} + the range's {} ports goes past 65535", f.name, b - a + 1),
+            );
         }
         match r.endpoint(&f.from) {
             Err(e) => d.error("E-FWD", format!("forward {}: from: {e}", f.name)),
@@ -430,6 +629,17 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             {
                 d.warn("E-RULE", format!("{what}: from {} is internal, but the rule is on the WAN", rule.from));
             }
+            // pf matches the WAN address and the WAN port: a forward to that
+            // host on another WAN port still passes
+            if let (Ok(t), Some(_)) = (&to, &rule.port)
+                && r.is_internal(t)
+                && !matches!(t, Endpoint::Router)
+            {
+                d.warn(
+                    "E-RULE",
+                    format!("{what}: on the WAN, the port is the WAN address's: a forward to {} on another port still passes", rule.to),
+                );
+            }
             continue;
         }
         let nets = r.rule_nets(&rule.network);
@@ -438,6 +648,33 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             continue;
         }
         let (Ok(from), Ok(to)) = (from, to) else { continue };
+        // tiers on one interface are told apart by source address: a rule for
+        // one of them takes the part of its source inside the tier's range
+        if let [n] = nets.as_slice()
+            && n.src.is_some()
+            && rule.network != RULE_ALL
+            && matches!(from, Endpoint::Table(_))
+        {
+            d.error(
+                "E-RULE",
+                format!(
+                    "{what}: tier {} shares its ports with other tiers, so a table can't be its source; use network = \"all\"",
+                    n.name
+                ),
+            );
+        }
+        if let (Some(a), Some(b)) = (r.endpoint_tier(&from), r.endpoint_tier(&to))
+            && a.name != b.name
+            && a.ifname == b.ifname
+        {
+            d.warn(
+                "E-RULE",
+                format!(
+                    "{what}: {} and {} share the house ports: devices there talk to each other directly, pf only sees what goes through the router",
+                    a.name, b.name
+                ),
+            );
+        }
         // a rule on every network only matters where its source can be
         let nets: Vec<_> =
             nets.into_iter().filter(|n| rule.network != RULE_ALL || r.endpoint_in_net(&from, n)).collect();
@@ -535,6 +772,18 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         d.warn("E-DNS", "only one DNS upstream; add a second for redundancy");
     }
     let zone = format!(".{}", c.system.domain);
+    // every record and override is a zone file of its own: two of one name,
+    // or one named like a zone we make anyway, would replace it
+    let mut zone_names: BTreeSet<String> = BTreeSet::new();
+    for n in c.dns.records.iter().map(|x| &x.name).chain(c.dns.overrides.iter().map(|x| &x.name)) {
+        let n = n.trim_end_matches('.').to_ascii_lowercase();
+        if n.ends_with(".in-addr.arpa") || n.ends_with(".ip6.arpa") || n == "use-application-dns.net" {
+            d.error("E-DNS", format!("{n}: a zone the router makes itself"));
+        }
+        if !zone_names.insert(n.clone()) {
+            d.error("E-DNS", format!("{n} is in dns.records or dns.overrides twice"));
+        }
+    }
     for rec in &c.dns.records {
         if !dns_name_ok(&rec.name) || !rec.name.contains('.') {
             d.error("E-DNS", format!("record {:?} is not a fully qualified name", rec.name));
@@ -548,6 +797,25 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     if c.ntp.servers.is_empty() {
         d.error("E-NTP", "ntp.servers is empty");
     }
+    for srv in &c.ntp.servers {
+        if !host_ok(srv) {
+            d.error("E-NTP", format!("ntp.servers {srv:?}: a host name or an address"));
+        }
+    }
+    // the router's names come from its own DNS over TLS, which needs the
+    // right time; ntpd starts before it and steps the clock only then
+    let wan_dhcp = matches!(c.wan.as_ref().and_then(|w| w.mode()), Some(WanMode::Dhcp));
+    if !c.ntp.servers.is_empty() && !wan_dhcp && c.ntp.servers.iter().all(|s| s.parse::<IpAddr>().is_err()) {
+        d.warn(
+            "E-NTP",
+            "every ntp server is a name: at boot ntpd can't resolve them (the DNS service starts later and needs the right time for TLS), so a clock that is far off is never stepped; add one by address, e.g. 162.159.200.123 (time.cloudflare.com)",
+        );
+    }
+    for k in &c.ntp.constraints {
+        if !constraint_ok(k) {
+            d.error("E-NTP", format!("ntp.constraints {k:?}: https://host or an address"));
+        }
+    }
     for s in &c.logging.remote {
         if parse_remote(s).is_none() {
             d.error("E-LOG", format!("logging.remote {s:?}: use udp://, tcp:// or tls://host[:port]"));
@@ -555,10 +823,15 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             d.warn("E-LOG", format!("logging.remote {s}: plaintext UDP; the design asks for tls://"));
         }
     }
-    if let Some(p) = &c.logging.pflow
-        && p.parse::<std::net::SocketAddrV4>().is_err()
-    {
-        d.error("E-LOG", format!("logging.pflow {p:?}: use ip:port"));
+    if let Some(p) = &c.logging.pflow {
+        match p.parse::<std::net::SocketAddrV4>() {
+            Err(_) => d.error("E-LOG", format!("logging.pflow {p:?}: use ip:port")),
+            // on the router itself it is octopus-collector, which listens there
+            Ok(a) if a.ip().is_loopback() && a.to_string() != "127.0.0.1:2055" => {
+                d.error("E-LOG", format!("logging.pflow {p}: the collector on the router is 127.0.0.1:2055"))
+            }
+            Ok(_) => {}
+        }
     }
 
     // ---- traffic
@@ -584,13 +857,16 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
 
     // ---- WireGuard
     if let Some(wg) = &c.wireguard {
-        check_secret_ref(&mut d, "wireguard.private_key", &wg.private_key, secrets);
+        check_router_secret(&mut d, "wireguard.private_key", &wg.private_key, secrets);
         if r.nets.iter().any(|n| n.prefix.contains(&wg.address.network()) || wg.address.contains(&n.prefix.network())) {
             d.error("E-WG", format!("wireguard.address {} overlaps a network", wg.address));
         }
         let mut pn = BTreeSet::new();
         let mut pa = BTreeSet::new();
         for p in &wg.peers {
+            if !name_ok(&p.name, 31) {
+                d.error("E-WG", format!("peer {:?}: a name of a-z, 0-9, _, - (max 31)", p.name));
+            }
             if !pn.insert(&p.name) {
                 d.error("E-WG", format!("duplicate peer {}", p.name));
             }
@@ -600,14 +876,14 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
                     format!("peer {}: address {} must be unique and inside {}", p.name, p.address, wg.address),
                 );
             }
-            if matches!(p.policy, Kind::Servers | Kind::Guest) {
+            if !matches!(p.policy, Kind::Mgmt | Kind::Lan) {
                 d.error("E-WG", format!("peer {}: policy must be mgmt or lan", p.name));
             }
-            if p.public_key.len() != 44 || !p.public_key.ends_with('=') {
+            if !wg_key_ok(&p.public_key) {
                 d.error("E-WG", format!("peer {}: public_key is not a WireGuard key", p.name));
             }
             if let Some(k) = &p.preshared_key {
-                check_secret_ref(&mut d, "wireguard.peers.preshared_key", k, secrets);
+                check_router_secret(&mut d, "wireguard.peers.preshared_key", k, secrets);
             }
         }
     }
@@ -622,7 +898,8 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if !vids.insert(v.name.clone()) {
             d.error("E-VHOST", format!("vhost {} defined twice", v.name));
         }
-        if v.hostnames.is_empty() && !dns_name_ok(&fqdn) {
+        // the name is in comments of nginx.conf and acme-client.conf even with hostnames
+        if !dns_name_ok(&v.name) || !dns_name_ok(&fqdn) {
             d.error("E-VHOST", format!("vhost {:?}: not a DNS name", v.name));
         }
         let (inside, outside) = v.split_names(domain);
@@ -672,7 +949,7 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             }
             (Some(a), Some(b)) => {
                 for p in [a, b] {
-                    if !p.starts_with('/') || p.contains(['"', ';', ' ', '\'', '{', '}']) {
+                    if !path_ok(p) {
                         d.error("E-VHOST", format!("vhost {}: {p:?} must be an absolute path", v.name));
                     }
                 }
@@ -694,7 +971,10 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         }
         match v.upstream.split_once("://") {
             Some(("http" | "https", rest))
-                if !rest.is_empty() && !rest.contains(['/', ' ', ';', '"', '\'', '{', '}']) =>
+                if !rest.is_empty()
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')) =>
             {
                 if v.upstream.starts_with("http://") && v.upstream_ca.is_some() {
                     d.warn("E-VHOST", format!("vhost {fqdn}: upstream_ca is ignored for an http upstream"));
@@ -703,7 +983,7 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             _ => d.error("E-VHOST", format!("vhost {fqdn}: upstream must be http://host:port or https://host:port")),
         }
         if let Some(ca) = &v.upstream_ca
-            && (!ca.starts_with('/') || ca.contains(['"', ';', ' ', '\'']))
+            && !path_ok(ca)
         {
             d.error("E-VHOST", format!("vhost {fqdn}: upstream_ca must be an absolute path"));
         }
@@ -723,6 +1003,48 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if v.upstream.starts_with("https://") && !v.verify_upstream {
             d.warn("E-VHOST", format!("vhost {fqdn}: the upstream's certificate is not checked"));
         }
+        // INV-1: a site that proxies the router's own sshd or web UI hands
+        // them to whoever reaches the site
+        let port: Option<u16> =
+            v.upstream.split_once("://").and_then(|x| x.1.rsplit_once(':')).and_then(|x| x.1.parse().ok());
+        let router_host = host.trim_matches(['[', ']']) == "localhost"
+            || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| {
+                ip.is_loopback()
+                    || r.nets
+                        .iter()
+                        .any(|n| IpAddr::V4(n.addr) == ip || n.v6.is_some_and(|x| IpAddr::V6(x.ula.addr()) == ip))
+                    || c.wireguard.as_ref().is_some_and(|w| IpAddr::V4(w.address.addr()) == ip)
+            });
+        if router_host && port.is_some_and(|p| p == ssh || web == Some(p)) {
+            if v.public {
+                d.error("INV-1", format!("vhost {fqdn}: a public site in front of the router's own ssh or web UI"));
+            } else {
+                d.warn(
+                    "INV-1",
+                    format!(
+                        "vhost {fqdn}: proxies the router's own ssh or web UI to every tier that reaches the vhosts"
+                    ),
+                );
+            }
+        }
+    }
+    // pf can't see the name: one public site's sources are every public site's
+    let lists: BTreeSet<Vec<String>> = c.vhosts.iter().filter(|v| v.public).map(|v| v.allow_from.clone()).collect();
+    if lists.len() > 1 {
+        d.warn(
+            "E-VHOST",
+            "public vhosts have different allow_from lists: pf lets in the union of them for every public site (a site open to all opens the others to all)",
+        );
+    }
+    // split horizon answers public names with the router's address, which
+    // guests and servers can't reach
+    if c.vhosts.iter().any(|v| v.public)
+        && r.nets.iter().any(|n| matches!(n.kind, Kind::Guest | Kind::Servers) || r.is_guest(&n.name))
+    {
+        d.warn(
+            "E-VHOST",
+            "public vhosts: inside, their names point at the router, which guests and servers can't reach; they don't get the public sites",
+        );
     }
 
     // ---- Wi-Fi: SSIDs onto router networks, access points by their [[hosts]]
@@ -765,8 +1087,15 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             match (&n.password, n.security) {
                 (Some(_), WifiSecurity::Open) => d.warn("E-WIFI", format!("{what}: open, the password is not used")),
                 (None, WifiSecurity::Open) => {}
-                (None, _) => d.error("E-WIFI", format!("{what}: needs password = \"secret:...\"")),
-                (Some(p), _) => check_secret_ref(&mut d, &what, p, secrets),
+                (None, _) => d.error("E-WIFI", format!("{what}: needs password = \"secret:wifi_...\"")),
+                (Some(p), _) => {
+                    check_secret_ref(&mut d, &what, p, secrets);
+                    // the web UI sets wifi_* secrets and the access points get
+                    // them: nothing else may travel that way
+                    if secrets::key_of(p).is_some_and(|k| !k.starts_with("wifi_")) {
+                        d.error("INV-8", format!("{what}: a Wi-Fi password is a secret:wifi_... key"));
+                    }
+                }
             }
             if n.bands.is_empty() {
                 d.error("E-WIFI", format!("{what}: no bands"));
@@ -783,9 +1112,18 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             if !ident_ok(&ap.name, 31) || !names.insert(&ap.name) {
                 d.error("E-WIFI", format!("{what}: a unique name of a-z, 0-9, _"));
             }
-            for (band, ch) in [("channel_2g", &ap.channel_2g), ("channel_5g", &ap.channel_5g)] {
-                if ch != "auto" && ch.parse::<u8>().is_err() {
-                    d.error("E-WIFI", format!("{what}: {band} is auto or a channel number"));
+            // the radio refuses a channel of the other band, and the push would still say ok
+            let ok_2g = |c: u16| (1..=14).contains(&c);
+            let ok_5g = |c: u16| {
+                ((36..=64).contains(&c) || (100..=144).contains(&c)) && c.is_multiple_of(4)
+                    || (149..=177).contains(&c) && c % 4 == 1
+            };
+            for (band, ch, ok) in
+                [("channel_2g", &ap.channel_2g, &ok_2g as &dyn Fn(u16) -> bool), ("channel_5g", &ap.channel_5g, &ok_5g)]
+            {
+                let valid = ch == "auto" || (ch.bytes().all(|b| b.is_ascii_digit()) && ch.parse::<u16>().is_ok_and(ok));
+                if !valid {
+                    d.error("E-WIFI", format!("{what}: {band} {ch:?} is auto or a channel of that band"));
                 }
             }
             let Some(h) = c.hosts.iter().find(|h| h.name == ap.host) else {
@@ -800,6 +1138,18 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
             for n in w.networks.iter().filter(|n| n.on(&ap.name)) {
                 let Some((_, net)) = r.net(&n.network) else { continue };
                 if net.name == home.name {
+                    // untagged onto the house ports: Kea places those clients by
+                    // MAC, and theirs aren't the tier's
+                    let wired = c.networks.iter().any(|x| x.name == net.name && x.wired);
+                    if net.src.is_some() && !wired {
+                        d.error(
+                            "E-WIFI",
+                            format!(
+                                "{what}: {:?} goes untagged into {}, which shares the house ports and places devices by MAC: its clients would land in another tier; give the SSID a VLAN tier",
+                                n.ssid, net.name
+                            ),
+                        );
+                    }
                     continue;
                 }
                 if net.vlan.is_none() {
@@ -897,9 +1247,6 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if n == c.system.domain || n.ends_with(&format!(".{}", c.system.domain)) {
             d.error("E-DNS", format!("override {n}: names in the internal zone are [[hosts]]"));
         }
-        if c.dns.records.iter().any(|r| r.name.trim_end_matches('.').eq_ignore_ascii_case(&n)) {
-            d.error("E-DNS", format!("override {n}: also in dns.records"));
-        }
         if !onames.insert(n.clone()) {
             d.error("E-DNS", format!("override {n} listed twice"));
         }
@@ -922,6 +1269,12 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     if !c.dns.views.is_empty() && c.dns.engine != DnsEngine::OctopusDns {
         d.error("E-DNS", "dns.views need engine = \"octopus-dns\"");
     }
+    if !c.dns.views.is_empty() && c.ipv6.mode == Ipv6Mode::Pd {
+        d.warn(
+            "E-DNS",
+            "dns.views tell clients apart by address: one asking from its delegated (global) IPv6 address gets the default view; keep views for relaxing, not restricting",
+        );
+    }
 
     // ---- proxy (phase 5): servers only; the interception root stays there (INV-5)
     if let Some(p) = &c.proxy {
@@ -941,6 +1294,17 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
                 let bare = h.strip_prefix("*.").unwrap_or(h);
                 if !dns_name_ok(bare) || bare.contains('*') {
                     d.error("E-PROXY", format!("proxy.allow: {h:?} is not a host name or *.domain"));
+                }
+                // anyone can have a name below these: a wildcard there lets a
+                // server send anything to anyone, over verified TLS
+                let shared = bare.trim_end_matches('.').to_ascii_lowercase();
+                if h.starts_with("*.")
+                    && SHARED_SUFFIXES.iter().any(|s| shared == *s || shared.ends_with(&format!(".{s}")))
+                {
+                    d.warn(
+                        "E-PROXY",
+                        format!("proxy.allow: {h} lets anyone's sites below {bare} in (a server can send data to its own); list the exact names"),
+                    );
                 }
             }
         }
@@ -971,14 +1335,27 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
         if a.action == AnalyzerAction::Block && (a.block_for == 0 || a.block_for > 7 * 86400) {
             d.error("E-ANALYZER", format!("analyzer rule {}: block_for must be 1..604800 seconds", a.name));
         }
+        if a.action == AnalyzerAction::Block
+            && let Some((_, n)) = r.net(&a.network)
+            && r.manages_router(n)
+        {
+            d.warn(
+                "E-ANALYZER",
+                format!(
+                    "analyzer rule {}: {} can manage the router, so its devices are never blocked (a forged packet must not lock an admin out)",
+                    a.name, n.name
+                ),
+            );
+        }
     }
 
     // ---- remote syslog over TLS
     for (k, v) in [("tls_ca", &c.logging.tls_ca), ("tls_cert", &c.logging.tls_cert), ("tls_key", &c.logging.tls_key)] {
+        // they become syslogd flags in rc.conf.local, which rc.subr hands to sh
         if let Some(p) = v
-            && (!p.starts_with('/') || p.contains(char::is_whitespace))
+            && !path_ok(p)
         {
-            d.error("E-LOG", format!("logging.{k}: an absolute path without spaces"));
+            d.error("E-LOG", format!("logging.{k}: an absolute path of a-z, A-Z, 0-9, /, ., _, -"));
         }
     }
     if c.logging.tls_cert.is_some() != c.logging.tls_key.is_some() {
@@ -1021,6 +1398,15 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
     }
 
     d
+}
+
+/// A secret the router itself uses: never a wifi_* one (those the web UI
+/// writes and the access points receive).
+fn check_router_secret(d: &mut Diagnostics, what: &str, s: &str, secrets: Option<&Secrets>) {
+    check_secret_ref(d, what, s, secrets);
+    if secrets::key_of(s).is_some_and(|k| k.starts_with("wifi_")) {
+        d.error("INV-8", format!("{what}: wifi_* secrets are for Wi-Fi passwords only"));
+    }
 }
 
 fn check_secret_ref(d: &mut Diagnostics, what: &str, s: &str, secrets: Option<&Secrets>) {
