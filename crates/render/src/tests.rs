@@ -769,7 +769,9 @@ fn ipv6_on_tiers_keeps_their_borders() {
     assert!(pf.contains("block in log quick on $if_cd inet6 proto { tcp udp } to ! self port 853 label \"dd:dot\""));
     // the prefix request leaves on the WAN: its multicast destination is a martian
     let solicit = pf
-        .find("pass out quick on $wan inet6 proto udp from fe80::/10 port dhcpv6-client to ff02::1:2 port dhcpv6-server")
+        .find(
+            "pass out quick on $wan inet6 proto udp from fe80::/10 port dhcpv6-client to ff02::1:2 port dhcpv6-server",
+        )
         .expect(pf);
     assert!(solicit < pf.find("block out quick on $wan inet6 to <martians6>").unwrap(), "{pf}");
     let guard = pf.find("inet6 proto tcp to self port $mgmt_ports label \"dd:guard\"").unwrap();
@@ -784,7 +786,10 @@ fn ipv6_on_tiers_keeps_their_borders() {
     let host = text.clone()
         + "\n[[rules]]\nnetwork = \"all\"\naction = \"block\"\nfrom = \"192.168.3.41\"\nto = \"internet\"\n";
     let pf = render(&router(&host), &SecretSource::Placeholder).unwrap().get("/etc/pf.conf").unwrap().content.clone();
-    assert!(pf.contains("block drop in quick on $if_wifi inet from 192.168.3.41 to ! <internal> label \"rule:5\""), "{pf}");
+    assert!(
+        pf.contains("block drop in quick on $if_wifi inet from 192.168.3.41 to ! <internal> label \"rule:5\""),
+        "{pf}"
+    );
     assert!(!pf.lines().any(|l| l.contains("inet6 from 192.168.3.41")), "{pf}");
 }
 
@@ -851,5 +856,44 @@ fn protected_prefixes_parse_where_they_are_read() {
     for v in list {
         let s = v.as_str().unwrap();
         assert!(s.parse::<ipnet::IpNet>().is_ok(), "{s} must be a prefix (ipnet)");
+    }
+}
+
+#[test]
+fn power_guard_and_fsck_repair() {
+    // no [power]: the daemon is declared off, no file
+    let g = render(&router(EXAMPLE), &SecretSource::Placeholder).unwrap();
+    assert!(g.get("/etc/octopus/power.json").is_none());
+    assert!(g.services.iter().any(|s| s.name == "octopus_power" && !s.enabled));
+    // the feed: the guard runs; the delays default
+    let text = format!("{EXAMPLE}\n[power]\nups = \"http://192.0.2.125:8765/\"\nfsck_repair = true\n");
+    let g = render(&router(&text), &SecretSource::Placeholder).unwrap();
+    assert!(g.services.iter().any(|s| s.name == "octopus_power" && s.enabled));
+    let v: serde_json::Value = serde_json::from_str(&g.get("/etc/octopus/power.json").unwrap().content).unwrap();
+    assert_eq!(v["ups"], "http://192.0.2.125:8765/");
+    assert_eq!(
+        (v["protect_after"].as_u64(), v["root_after"].as_u64(), v["restore_after"].as_u64()),
+        (Some(30), Some(300), Some(60))
+    );
+    assert_eq!(v["fsck_repair"], true);
+    // fsck_repair alone: the file, no daemon
+    let g = render(&router(&format!("{EXAMPLE}\n[power]\nfsck_repair = true\n")), &SecretSource::Placeholder).unwrap();
+    assert!(g.get("/etc/octopus/power.json").is_some());
+    assert!(g.services.iter().any(|s| s.name == "octopus_power" && !s.enabled));
+    assert!(check_errors(&text).is_empty(), "{:?}", check_errors(&text));
+    // what check refuses: not http, junk in the url, / before the others
+    for bad in [
+        "ups = \"https://192.0.2.125:8765/\"",
+        "ups = \"http://192.0.2.125:8765/x y\"",
+        "ups = \"http://-x:8765/\"",
+        "ups = \"http://192.0.2.125:0/\"",
+        "ups = \"http://192.0.2.125/\"\nprotect_after = 60\nroot_after = 30",
+    ] {
+        let t = format!("{EXAMPLE}\n[power]\n{bad}\n");
+        assert!(check_errors(&t).iter().any(|e| e.starts_with("E-POWER")), "{bad}: {:?}", check_errors(&t));
+    }
+    for good in ["http://[2001:db8::7]:8765/", "http://ups.home.arpa/status", "http://192.0.2.125"] {
+        let t = format!("{EXAMPLE}\n[power]\nups = \"{good}\"\n");
+        assert!(check_errors(&t).is_empty(), "{good}: {:?}", check_errors(&t));
     }
 }

@@ -470,6 +470,32 @@ access points are elsewhere.
 reaches it on), `channel_2g` / `channel_5g` (`auto` or a number),
 `description`.
 
+## [power]
+
+What a power cut may do to the disks. The router's own UPS usually can't be
+read; another UPS's feed (its host on the same mains) says when the mains is
+gone.
+
+```toml
+[power]
+ups = "http://192.168.1.21:8765/"   # ups-api JSON: status.on_battery, status.low_battery
+# protect_after = 30                 # s on battery: all but /, /var, /tmp read-only
+# root_after = 300                   # s on battery: / too (0: never); at once on a low battery
+# restore_after = 60                 # s back on mains: writable again
+fsck_repair = true
+```
+
+| key | default | |
+|---|---|---|
+| `ups` | — | `http://host[:port]/path`; without it no guard runs (`octopus_power`) |
+| `protect_after` | 30 | seconds on battery before every FFS file system in fstab but /, /var and /tmp goes read-only |
+| `root_after` | 300 | seconds on battery before / goes read-only too; 0: never. A low battery, or the feed silent for 30 s while on battery (its host shuts down near the end), does it at once. Applies and rollbacks wait for the mains |
+| `restore_after` | 60 | seconds back on mains before they are writable again |
+| `fsck_repair` | false | at boot, a check `fsck -p` can't finish is repaired with `fsck -y` and the boot goes on, as pfSense does, instead of stopping at a shell; octopus keeps this one change in `/etc/rc` (docs/design.md) |
+
+A silent feed on mains changes nothing. `octopus power status` shows the
+feed, what is read-only and whether /etc/rc repairs.
+
 ## secrets.toml
 
 A flat table of strings, mode 0600, never committed:

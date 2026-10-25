@@ -42,6 +42,18 @@ fn lookup_id(file: &str, name: &str) -> Option<u32> {
     })
 }
 
+/// A user's uid and primary gid, from /etc/passwd.
+pub fn ids_of(user: &str) -> Option<(u32, u32)> {
+    let text = fs::read_to_string("/etc/passwd").ok()?;
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() < 4 || f[0] != user {
+            return None;
+        }
+        Some((f[2].parse().ok()?, f[3].parse().ok()?))
+    })
+}
+
 /// Write via a temp file in the same directory, then rename. The temp file
 /// is new (O_EXCL, never a symlink), gets its owner and mode before any
 /// content, and the directory is synced after the rename.

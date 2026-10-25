@@ -62,6 +62,46 @@ pub struct Config {
     pub analyzer: Analyzer,
     /// Wi-Fi on OpenWrt access points that octopus configures.
     pub wifi: Option<Wifi>,
+    pub power: Option<Power>,
+}
+
+/// Power loss. The router's own UPS can't be read; another UPS's feed says
+/// when the mains is gone. On battery the file systems the router rarely
+/// writes go read-only, so a power cut leaves fsck little to repair, and the
+/// boot repairs what is left instead of stopping at a shell.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Power {
+    /// The UPS feed, `http://host[:port]/path`: ups-api's JSON
+    /// (`status.on_battery`, `status.low_battery`). None: no power guard.
+    pub ups: Option<String>,
+    /// Seconds on battery before every file system but /, /var and /tmp goes read-only.
+    #[serde(default = "default_protect_after")]
+    pub protect_after: u32,
+    /// Seconds on battery before / goes read-only too (applies wait for the
+    /// mains); 0: never. A low battery, or the feed gone quiet on battery, does it at once.
+    #[serde(default = "default_root_after")]
+    pub root_after: u32,
+    /// Seconds back on mains before they are writable again.
+    #[serde(default = "default_restore_after")]
+    pub restore_after: u32,
+    /// At boot, a file system check that fails is repaired with `fsck -y`
+    /// and the boot goes on, as pfSense does, instead of stopping at a shell.
+    /// Octopus keeps this one change in /etc/rc (docs/design.md, R3).
+    #[serde(default)]
+    pub fsck_repair: bool,
+}
+
+fn default_protect_after() -> u32 {
+    30
+}
+
+fn default_root_after() -> u32 {
+    300
+}
+
+fn default_restore_after() -> u32 {
+    60
 }
 
 /// Wi-Fi: the networks (SSIDs) and the access points that broadcast them.

@@ -15,7 +15,7 @@
 set -eu
 [ $# -eq 1 ] || { echo "usage: $0 siteXY.tgz" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
-daemons="octopus_pfhelper octopus_hickory octopus_dns octopus_web octopus_filterlog octopus_proxy octopus_collector octopus_analyzer octopus_kea octopus_guard"
+daemons="octopus_pfhelper octopus_hickory octopus_dns octopus_web octopus_filterlog octopus_proxy octopus_collector octopus_analyzer octopus_kea octopus_guard octopus_power"
 
 # all of it readable, nothing that would replace a directory
 gzip -t "$1" || { echo "$1 is damaged" >&2; exit 1; }

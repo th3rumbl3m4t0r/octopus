@@ -155,6 +155,19 @@ pub fn constraint_ok(s: &str) -> bool {
     host_ok(host) && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~'))
 }
 
+/// The UPS feed: `http://host[:port][/path]`, handed to ftp(1) as one argument.
+pub fn ups_url_ok(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("http://") else { return false };
+    let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = match hostport.rsplit_once(':') {
+        Some((h, p)) if !h.ends_with(':') && p.parse::<u16>().is_ok_and(|p| p > 0) => h,
+        _ => hostport,
+    };
+    s.len() <= 200
+        && host_ok(host)
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~'))
+}
+
 /// Every string in the file, with where it is: control characters (a
 /// newline above all) would start a new line in some generated file.
 fn control_chars(c: &Config, d: &mut Diagnostics) {
@@ -831,6 +844,24 @@ pub fn check(r: &Router, secrets: Option<&Secrets>) -> Diagnostics {
                 d.error("E-LOG", format!("logging.pflow {p}: the collector on the router is 127.0.0.1:2055"))
             }
             Ok(_) => {}
+        }
+    }
+
+    // ---- power
+    if let Some(p) = &c.power {
+        if let Some(u) = &p.ups
+            && !ups_url_ok(u)
+        {
+            d.error("E-POWER", format!("power.ups {u:?}: http://host[:port]/path (the ups-api feed)"));
+        }
+        if p.root_after != 0 && p.root_after < p.protect_after {
+            d.error(
+                "E-POWER",
+                format!("power.root_after {}: 0 or at least protect_after ({})", p.root_after, p.protect_after),
+            );
+        }
+        if p.ups.is_none() && !p.fsck_repair {
+            d.warn("E-POWER", "[power] has neither ups nor fsck_repair: it does nothing");
         }
     }
 

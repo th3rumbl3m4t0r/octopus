@@ -28,6 +28,7 @@ with these deviations and decisions; everything else stands as written.
 | Networks | one network per port or VLAN, fixed kinds | tiers: every house port one bridge; devices placed by MAC (Kea classes), cable or Wi-Fi VLAN; open tiers with the policy as ordinary rules; a guard cutting off devices that take a listed-only tier's address | owner's decision 2026-10-02: easy to manage, the same source address everywhere |
 | DHCP | dhcpd | Kea (package), as on pfSense | MAC prefixes need client classes |
 | Access points | — | OpenWrt access points configured over SSH from `[wifi]` (SSIDs onto networks, guest networks as VLANs on the bridge); images from OpenWrt's Image Builder with the router's key | owner's request |
+| Power loss | — (R3: never edit base files) | `[power]`: `octopus_power` reads a UPS feed (ups-api JSON from another UPS's host) and, on battery, remounts every file system but /, /var and /tmp read-only, / later; `fsck_repair` changes one case of `/etc/rc`'s `do_fsck` (a failed `fsck -p` runs `fsck -y` and the boot goes on, as pfSense's rc does), put back by `octopus boot` and `supervise` after an upgrade and left alone if do_fsck isn't the known one. The feed is fetched by ftp(1) and parsed by a child running as nobody, which prints one word to the root daemon (R6) | owner's exception to R3 (2026-10-25): stock rc stops the boot at a shell and the router stays down until someone runs fsck at its screen; the router's own UPS can't be read |
 | Not yet | | LTE failover | |
 
 ---

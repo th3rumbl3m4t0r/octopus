@@ -14,6 +14,7 @@ mod net;
 pub mod nginx;
 mod pf;
 pub mod policy;
+mod power;
 pub mod proxy;
 mod services;
 mod v6;
@@ -184,6 +185,7 @@ pub fn render(r: &Router, secrets: &SecretSource) -> Result<Generation, String> 
     analyzer::render(r, &mut g);
     wifi::render(r, secrets, &mut g)?;
     guard::render(r, &mut g);
+    power::render(r, &mut g);
     g.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(g)
 }

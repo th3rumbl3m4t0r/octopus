@@ -171,7 +171,9 @@ pub fn dhcp(host: &str, user: &str) -> String {
         "span2",
     ) + &win(
         "leases",
-        "<span class=\"dim\">Kea's leases; reserve keeps a device on its address</span>",
+        "<select id=\"lease-af\" aria-label=\"address family\"><option value=\"\">IPv4 + IPv6</option>\
+         <option value=\"4\">IPv4</option><option value=\"6\">IPv6</option></select> \
+         <span class=\"dim\">IPv4: Kea's leases, reserve keeps a device on its address; IPv6: the addresses devices picked (SLAAC)</span>",
         "<table class=\"x11\" id=\"t-leases\"></table>",
         "span2",
     );

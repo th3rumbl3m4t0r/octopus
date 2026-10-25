@@ -45,7 +45,7 @@ install -m 555 target/release/octopus target/release/octopus-web target/release/
     target/release/octopus-analyzer "$hickory" "$stage/usr/local/sbin/"
 install -m 555 deploy/rc.d/octopus_hickory deploy/rc.d/octopus_dns deploy/rc.d/octopus_web \
     deploy/rc.d/octopus_pfhelper deploy/rc.d/octopus_filterlog deploy/rc.d/octopus_proxy \
-    deploy/rc.d/octopus_collector deploy/rc.d/octopus_analyzer deploy/rc.d/octopus_kea deploy/rc.d/octopus_guard \
+    deploy/rc.d/octopus_collector deploy/rc.d/octopus_analyzer deploy/rc.d/octopus_kea deploy/rc.d/octopus_guard deploy/rc.d/octopus_power \
     "$stage/etc/rc.d/"
 install -m 644 deploy/doas.conf "$stage/etc/octopus/doas.conf"
 install -m 644 "$site/router.toml" "$stage/etc/octopus/router.toml"

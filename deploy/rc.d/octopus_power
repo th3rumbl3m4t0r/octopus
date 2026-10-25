@@ -1,0 +1,16 @@
+#!/bin/ksh
+#
+# octopus power: while the UPS feed says the mains is gone, the file systems
+# the router rarely writes are read-only; /etc/octopus/power.json.
+
+daemon="/usr/local/sbin/octopus"
+daemon_flags="power run"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+pexp="${daemon} power run"
+
+rc_cmd $1

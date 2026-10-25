@@ -164,14 +164,24 @@
     },
     dhcp: function (s) {
       var now = Date.now() / 1000;
-      var reserved = {};
+      var reserved = {}, named = {}, nets = {};
       (((work && work.doc) || {}).hosts || []).forEach(function (x) { if (x.mac) reserved[x.mac.toLowerCase()] = x.name; });
-      table('t-leases', ['address', 'mac', 'hostname', 'ends (UTC)', ''], (s.leases || []).map(function (l) {
+      (s.leases || []).forEach(function (l) { if (l.hostname) named[(l.mac || '').toLowerCase()] = l.hostname; });
+      (s.interfaces || []).forEach(function (i) { nets[i.name] = i.description || i.name; });
+      var af = $('lease-af').value;
+      var rows = af === '6' ? [] : (s.leases || []).map(function (l) {
         var r = reserved[(l.mac || '').toLowerCase()];
         return '<tr>' + td(esc(l.ip)) + td(esc(l.mac), 'dim') + td(esc(l.hostname || '')) + td(esc(l.ends || ''), l.abandoned ? 'bad' : 'dim') +
           td(r ? '<span class="dim">reserved: ' + esc(r) + '</span>' : '<button type="button" data-reserve="1" data-ip="' + esc(l.ip) + '" data-mac="' + esc(l.mac) +
             '" data-host="' + esc(l.hostname || '') + '">reserve</button>') + '</tr>';
+      });
+      // IPv6 has no leases: the devices' own addresses, named by their IPv4 lease or reservation (same mac)
+      if (af !== '4') rows = rows.concat((s.neighbours6 || []).map(function (n) {
+        var mac = (n.mac || '').toLowerCase(), r = reserved[mac];
+        return '<tr>' + td(esc(n.ip)) + td(esc(n.mac), 'dim') + td(esc(named[mac] || r || '')) +
+          td('SLAAC on ' + esc(nets[n.interface] || n.interface), 'dim') + td(r ? '<span class="dim">reserved: ' + esc(r) + '</span>' : '') + '</tr>';
       }));
+      table('t-leases', ['address', 'mac', 'hostname', 'ends (UTC)', ''], rows);
       void now;
     },
     dns: function (s) {
@@ -1496,6 +1506,7 @@
       $('tr-if').addEventListener('change', function () { trIf = this.value; traffic(); });
       $('tr-range').addEventListener('change', function () { trRange = this.value; traffic(); });
     }
+    if (page === 'dhcp') $('lease-af').addEventListener('change', function () { if (last) render.dhcp(last); });
     changesWindow();
     // the working copy and the schema first: most pages build on them
     Promise.all([loadWork(), loadSchema()]).then(function () {

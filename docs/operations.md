@@ -303,6 +303,21 @@ are taken over by name on the next push. After reflashing an access point,
 each; a script counts as taken on the access point only once its reload
 went through.
 
+## Power loss
+
+`[power]` (router-toml.md). With `ups`, `octopus_power` asks the feed every 5 s;
+`octopus power status` shows what it last said and what it made read-only, and
+each change is logged (`grep octopus /var/log/daemon`). While / is read-only,
+`apply` and `rollback` refuse ("on battery: ..."); the mains back for
+`restore_after` makes everything writable again.
+
+With `fsck_repair`, a failed boot check runs `fsck -y` (twice if needed) and
+the boot goes on; it can cut short or move to lost+found a file that was being
+written when the power went. After `sysupgrade` /etc/rc is OpenBSD's again
+until `octopus boot` (or the next `supervise`, within 5 minutes) puts the
+change back; a release whose do_fsck changed is left alone and `power status`
+says so. To undo it: `fsck_repair = false` and apply.
+
 ## Supervision
 
 Cron runs `octopus supervise` every 5 minutes (install.site adds it to

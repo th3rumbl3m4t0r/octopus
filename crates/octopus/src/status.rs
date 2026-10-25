@@ -217,6 +217,31 @@ fn time_utc(t: i64) -> String {
     format!("{y:04}/{m:02}/{d:02} {:02}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
+/// IPv6 clients pick their own addresses from rad's prefixes (SLAAC), so
+/// there are no leases: the neighbour cache shows who uses which.
+fn neighbours6() -> Vec<Value> {
+    neighbours6_from(&run("ndp", &["-an"]).unwrap_or_default())
+}
+
+/// `ndp -an`: neighbour, link-layer address, interface, expiry, ...; the
+/// router's own (permanent), link-local and unresolved ones left out.
+fn neighbours6_from(text: &str) -> Vec<Value> {
+    let mut v: Vec<Value> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (ip, mac, ifname, expire) = (*f.first()?, *f.get(1)?, *f.get(2)?, *f.get(3)?);
+            if ip.starts_with("fe80:") || expire == "permanent" || mac.len() != 17 {
+                return None;
+            }
+            Some(json!({"ip": ip, "mac": mac, "interface": ifname, "expires": expire}))
+        })
+        .collect();
+    v.sort_by(|a, b| (a["mac"].as_str(), a["ip"].as_str()).cmp(&(b["mac"].as_str(), b["ip"].as_str())));
+    v
+}
+
 /// IPv6 prefix delegation: what dhcp6leased holds for the WAN.
 fn ipv6() -> Value {
     if !crate::os::ok("rcctl", &["get", "dhcp6leased", "status"]) {
@@ -417,6 +442,8 @@ pub fn collect() -> Value {
         "interfaces": ifaces(),
         "pf": pf_info(),
         "leases": leases(),
+        "neighbours6": neighbours6(),
+        "power": crate::power::status_json(),
         "services": services(&[
             "octopus_hickory",
             "octopus_dns",
@@ -428,6 +455,7 @@ pub fn collect() -> Value {
             "octopus_analyzer",
             "octopus_kea",
             "octopus_guard",
+            "octopus_power",
             "dhcp6leased",
             "rad",
             "nginx",
@@ -487,6 +515,20 @@ mod lease_tests {
         let l = super::leases_from(&super::joined(&[two, String::new(), current]), 1000);
         let ips: Vec<&str> = l.iter().map(|x| x["ip"].as_str().unwrap()).collect();
         assert_eq!(ips, ["192.168.4.18"], "{l:?}");
+    }
+
+    #[test]
+    fn ndp_neighbours() {
+        // as on a router: its own address, a guest, a link-local one, an unresolved one
+        let out = "Neighbor                                Linklayer Address  Netif Expire    S Flags\n\
+                   2001:db8:0:3::1                         02:00:5e:10:00:41  vport1 permanent R l\n\
+                   2001:db8:0:4:9056:9b10:59ef:c0ab        02:00:5e:10:00:44  vport2 23h59m17s S\n\
+                   fe80::5eff:fe10:42%vport1              02:00:5e:10:00:42  vport1 5h15m54s  S\n\
+                   2001:db8::5                             (incomplete)       vport0 expired   N\n";
+        let n = super::neighbours6_from(out);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert_eq!(n[0]["ip"], "2001:db8:0:4:9056:9b10:59ef:c0ab");
+        assert_eq!(n[0]["interface"], "vport2");
     }
 }
 

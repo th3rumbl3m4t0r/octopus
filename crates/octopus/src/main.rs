@@ -31,6 +31,7 @@ mod gens;
 mod guard;
 mod os;
 mod pki;
+mod power;
 mod secret;
 mod status;
 mod validate;
@@ -74,6 +75,10 @@ access points (OpenWrt, [wifi])
 tiers
   guard run                                      (octopus_guard) cut off devices on restricted addresses
   guard status | release MAC                     the blocked devices; lift a block
+
+power ([power])
+  power run                                      (octopus_power) file systems read-only while the UPS is on battery
+  power status                                   the UPS feed, what is read-only, the boot's fsck repair
 
 pfSense migration
   import-pfsense config.xml -o router.toml --secrets-out secrets.toml [--report FILE]
@@ -286,6 +291,7 @@ fn cmd_diff(a: &Args) -> Res<()> {
 fn cmd_apply(a: &Args) -> Res<()> {
     need_root()?;
     let _l = os::lock(&apply::lock_path())?;
+    on_mains()?;
     let st = apply::load_state()?;
     if let Some(p) = &st.pending {
         return Err(format!("generation {} is waiting for confirm or rollback", p.generation));
@@ -500,6 +506,7 @@ fn cmd_confirm() -> Res<()> {
 fn cmd_rollback(a: &Args) -> Res<()> {
     need_root()?;
     let _l = os::lock(&apply::lock_path())?;
+    on_mains()?;
     let st = apply::load_state()?;
     match a.pos.first() {
         None => {
@@ -621,6 +628,8 @@ fn cmd_status(a: &Args) -> Res<()> {
 fn cmd_boot() -> Res<()> {
     need_root()?;
     let _l = os::lock(&apply::lock_path())?;
+    // after an upgrade /etc/rc is OpenBSD's again: the fsck repair goes back in
+    power::ensure_rc();
     let st = apply::load_state().inspect_err(|e| log(&format!("boot: {e}")))?;
     let r = boot_revert(&st);
     // whatever generation is live now: are its ports where it put them, and
@@ -638,6 +647,7 @@ fn cmd_boot() -> Res<()> {
 /// while an apply or rollback runs.
 fn cmd_supervise() -> Res<()> {
     let Ok(_l) = os::lock(&apply::lock_path()) else { return Ok(()) };
+    power::ensure_rc();
     let st = apply::load_state()?;
     let Some(m) = st.current.and_then(|c| gens::load(c).ok()) else { return Ok(()) };
     // a boot lockdown keeps DHCP off until an apply lifts it
@@ -656,6 +666,15 @@ fn cmd_supervise() -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Applies and rollbacks write /etc: not while the power guard has it read-only.
+fn on_mains() -> Res<()> {
+    let ro = power::readonly_now();
+    if !ro.iter().any(|m| m == "/") {
+        return Ok(());
+    }
+    Err(format!("on battery: the power guard has {} read-only; try again once the mains is back", ro.join(" ")))
 }
 
 fn boot_revert(st: &apply::State) -> Res<()> {
@@ -817,6 +836,11 @@ fn main() -> ExitCode {
             )
         }),
         "guard" => need_root().and_then(|_| guard::cmd(&a.pos, a.flag("--staged"))),
+        "power" => need_root().and_then(|_| power::cmd(&a.pos)),
+        "_power-probe" => match a.pos.first() {
+            Some(url) => power::probe(url),
+            None => Err("usage: _power-probe URL".into()),
+        },
         "secret" => need_root().and_then(|_| secret::cmd(&a.pos, a.flag("--staged"))),
         "redact" => cmd_redact(&a),
         "_watchdog" => {
